@@ -11,7 +11,7 @@ import json
 import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
-from config import DB_PATH, INDEX_ROOT
+from pipelines.config import  DB_PATH, INDEX_ROOT
 
 MODEL_NAME = "BAAI/bge-small-en-v1.5"
 BATCH_SIZE = 64

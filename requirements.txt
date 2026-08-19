@@ -1,4 +1,7 @@
 fastapi
+streamlit
+pandas
+numpy
 uvicorn[standard]
 pydantic
 sentence-transformers

@@ -1,59 +1,55 @@
-"""Streamlit UI -- gọi backend API, không chứa logic retrieval nào ở đây."""
+"""Điểm vào giao diện -- chỉ còn control flow, logic UI/API đã tách sang
+components.py / api.py / styles.py."""
 
 import streamlit as st
-import requests
+from api import AicApiClient
+from components import (
+    render_sidebar,
+    render_results,
+    render_kis_input,
+    render_qa_input,
+    render_trake_input,
+)
+from styles import inject_css
 
-API_URL = st.secrets.get("API_URL", "http://localhost:8000")
-
-st.set_page_config(page_title="AIC26 Video Retrieval", layout="wide")
+st.set_page_config(page_title="AIC26 Video Retrieval", layout="wide", page_icon="🎥")
+inject_css(st)
 st.title("🎥 AIC26 — Video Retrieval")
 
-mode = st.sidebar.radio("Loại truy vấn", ["KIS", "Q&A", "TRAKE"])
-top_n = st.sidebar.slider("Số kết quả", 1, 20, 10)
-
-
-def render_results(results: list[dict]):
-    """Hiển thị lưới ảnh keyframe (4 cột) cho 1 list kết quả đã rerank."""
-    cols = st.columns(4)
-    for i, r in enumerate(results):
-        with cols[i % 4]:
-            img_url = f"{API_URL}/api/keyframe/{r['frame_id']}/image"
-            st.image(img_url, use_container_width=True)
-            st.caption(f"{r['video_id']} @ {r['timestamp']:.1f}s\nscore={r.get('rerank_score', 0):.3f}")
-
+api = AicApiClient(st.secrets.get("API_URL", "http://localhost:8000"))
+mode, top_n, n_cols = render_sidebar()
 
 if mode == "KIS":
-    query = st.text_input("Nhập mô tả cảnh cần tìm")
-    if st.button("Tìm") and query:
+    query = render_kis_input()
+    if query:
         with st.spinner("Đang tìm..."):
-            resp = requests.post(f"{API_URL}/api/kis", json={"query": query, "top_n": top_n})
-        if resp.ok:
-            render_results(resp.json()["results"])
-        else:
-            st.error(resp.text)
+            try:
+                results = api.search_kis(query, top_n=top_n)
+                render_results(results, api, n_cols)
+            except Exception as e:
+                st.error(str(e))
 
 elif mode == "Q&A":
-    query = st.text_input("Nhập câu hỏi")
-    if st.button("Hỏi") and query:
+    query = render_qa_input()
+    if query:
         with st.spinner("Đang suy nghĩ..."):
-            resp = requests.post(f"{API_URL}/api/qa", json={"query": query, "top_n": top_n})
-        if resp.ok:
-            data = resp.json()
-            st.markdown(data["answer"])
-            st.divider()
-            render_results(data["sources"])
-        else:
-            st.error(resp.text)
+            try:
+                data = api.ask_qa(query, top_n=top_n)
+                st.markdown(f"### Trả lời\n{data['answer']}")
+                st.divider()
+                render_results(data["sources"], api, n_cols)
+            except Exception as e:
+                st.error(str(e))
 
 elif mode == "TRAKE":
-    events_raw = st.text_area("Nhập các sự kiện, mỗi dòng 1 sự kiện, theo đúng thứ tự")
-    if st.button("Tìm chuỗi sự kiện") and events_raw.strip():
-        events = [e.strip() for e in events_raw.splitlines() if e.strip()]
+    events = render_trake_input()
+    if events:
         with st.spinner("Đang tìm..."):
-            resp = requests.post(f"{API_URL}/api/trake", json={"events": events, "top_n": top_n})
-        if resp.ok:
-            for event_text, event_results in zip(events, resp.json()["results"]):
-                st.subheader(event_text)
-                render_results(event_results)
-        else:
-            st.error(resp.text)
+            try:
+                results_per_event = api.search_trake(events, top_n=top_n)
+                for event_text, event_results in zip(events, results_per_event):
+                    st.subheader(f"📌 {event_text}")
+                    render_results(event_results, api, n_cols)
+                    st.divider()
+            except Exception as e:
+                st.error(str(e))

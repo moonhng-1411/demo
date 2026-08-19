@@ -6,7 +6,7 @@ import numpy as np
 import faiss
 from sentence_transformers import SentenceTransformer
 import sqlite3
-from config import DB_PATH, INDEX_ROOT
+from pipelines.config import DB_PATH, INDEX_ROOT
 
 
 def main():
