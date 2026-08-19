@@ -78,6 +78,7 @@ py -m venv venv
 
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+cp .env.example .env                        # rồi điền GROQ_API_KEY
 ```
 
 Nếu PowerShell chặn activate script, có thể chạy trực tiếp executable trong virtual environment mà không activate:
