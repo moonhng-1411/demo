@@ -3,6 +3,8 @@ import re
 from dataclasses import dataclass, replace, asdict
 
 import numpy as np
+import open_clip
+import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 
@@ -32,34 +34,37 @@ class TextEmbedder:
 
 
 class ClipQueryEmbedder:
-    """Encode câu truy vấn text sang vector CLIP (512-dim), dùng cho
-    faiss_clip.index (ảnh keyframe) -- cùng không gian embedding với ảnh
-    nên có thể query text -> ảnh trực tiếp."""
+    """Encode câu truy vấn text sang vector CLIP (512-dim) đúng KHỚP không
+    gian embedding BTC dùng lúc build faiss_clip.index -- open_clip OpenAI
+    ViT-B/32 checkpoint, KHÔNG dùng sentence-transformers wrapper (đã xác
+    nhận sai không gian, verify ra 0/10)."""
 
-    def __init__(self, model_name="clip-ViT-B-32", device="cpu"):
-        self.model = SentenceTransformer(model_name, device=device)
+    def __init__(self, device: str = "cpu"):
+        import open_clip
+        self.device = device
+        self.model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
+        self.tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        self.model.to(device).eval()
 
     def encode(self, text: str) -> np.ndarray:
-        return np.asarray(self.model.encode(text), dtype="float32")
+        """Trả về vector đã L2-normalize (khớp cách build index: inner product
+        trên vector đã normalize = cosine similarity)."""
+        import torch
+        with torch.no_grad():
+            tokens = self.tokenizer([text]).to(self.device)
+            vec = self.model.encode_text(tokens)
+            vec = vec / vec.norm(dim=-1, keepdim=True)
+        return vec.cpu().numpy().astype("float32")[0]
 
 
 class Retriever:
-    """Gộp kết quả từ 2 FAISS index (text: caption+asr, clip: ảnh) thành
-    1 dict {modality: [Candidate]} để đưa vào fusion."""
-
     def __init__(self, faiss_manager, sqlite_manager, text_embedder=None, clip_embedder=None):
         self.faiss_manager = faiss_manager
         self.sqlite_manager = sqlite_manager
         self.text_embedder = text_embedder or TextEmbedder()
         self.clip_embedder = clip_embedder or ClipQueryEmbedder()
 
-    def _text_candidate(self, entry: dict, modality: str, score: float) -> Candidate:
-        """Chuyển 1 hit từ faiss_text.index thành Candidate.
-
-        entry["kind"] == "asr": entry không có sẵn keyframe_id (chỉ có
-        transcript_id) -- phải resolve sang keyframe gần nhất theo thời gian.
-        entry["kind"] == "caption": đã có sẵn keyframe_id 1-1.
-        """
+    def _text_candidate(self, entry, modality, score):
         frame_id = (
             self.sqlite_manager.resolve_transcript_to_frame(entry["transcript_id"])
             if modality == "asr" else entry["keyframe_id"]
@@ -67,17 +72,11 @@ class Retriever:
         info = self.sqlite_manager.get_frame_info(frame_id)
         return Candidate(frame_id, info["video_id"], info["pts_time"], float(score), modality)
 
-    def _visual_candidate(self, frame_id: int, score: float) -> Candidate:
-        """Chuyển 1 hit từ faiss_clip.index (đã map sẵn ra keyframe_id qua
-        clip_id_map.npy) thành Candidate."""
+    def _visual_candidate(self, frame_id, score):
         info = self.sqlite_manager.get_frame_info(frame_id)
         return Candidate(frame_id, info["video_id"], info["pts_time"], float(score), "visual")
 
-    def search(self, query: str, top_k: int = 50) -> dict:
-        """Truy vấn cả 2 index (text + clip) song song, trả về:
-        {"caption": [Candidate], "asr": [Candidate], "visual": [Candidate]}
-        Dùng cho 1 câu query đơn (KIS/Q&A). Với TRAKE, gọi search() nhiều lần
-        qua search_events()."""
+    def search(self, query, top_k=50):
         results = {"caption": [], "asr": [], "visual": []}
 
         text_vec = self.text_embedder.encode(query)
@@ -90,11 +89,8 @@ class Retriever:
 
         return results
 
-    def search_events(self, events: list[str], top_k: int = 50) -> list[dict]:
-        """Dùng cho TRAKE -- search riêng từng event, giữ đúng thứ tự events
-        truyền vào (không được sắp xếp lại)."""
+    def search_events(self, events, top_k=50):
         return [self.search(e, top_k=top_k) for e in events]
-
 
 DEFAULT_MODALITY_WEIGHTS = {"caption": 1.0, "asr": 0.8, "visual": 1.0}
 DEFAULT_OBJECT_WEIGHT = 0.5

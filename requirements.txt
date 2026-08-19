@@ -8,6 +8,7 @@ sentence-transformers
 faiss-cpu
 transformers
 torch
+open_clip_torch>=2.24.0
 faster-whisper
 yt-dlp
 groq

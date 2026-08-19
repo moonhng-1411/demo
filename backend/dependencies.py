@@ -11,15 +11,21 @@ from rag.pipeline import Retriever, Reranker, RagPipeline, GroqClient
 
 DB_PATH = os.environ.get("AIC_DB_PATH", "data/aic.sqlite")
 INDEX_ROOT = os.environ.get("AIC_INDEX_ROOT", "data/index")
+_DEFAULT_JSON_MAP = f"{INDEX_ROOT}/id_map.json"
+_DEFAULT_NPY_MAP = f"{INDEX_ROOT}/clip_id_map.npy"
+CLIP_ID_MAP_PATH = os.environ.get(
+    "AIC_CLIP_ID_MAP_PATH",
+    _DEFAULT_JSON_MAP if os.path.exists(_DEFAULT_JSON_MAP) else _DEFAULT_NPY_MAP,
+)
 
 sqlite_manager = SqliteManager(DB_PATH)
 faiss_manager = FaissManager(
     text_index_path=f"{INDEX_ROOT}/faiss_text.index",
     text_metadata_path=f"{INDEX_ROOT}/text_embedding_metadata.jsonl",
     clip_index_path=f"{INDEX_ROOT}/faiss_clip.index",
-    clip_id_map_path=f"{INDEX_ROOT}/clip_id_map.npy",
+    clip_id_map_path=f"{INDEX_ROOT}/id_map.json",   # đổi từ clip_id_map.npy
 )
-retriever = Retriever(faiss_manager, sqlite_manager)
+retriever = Retriever(faiss_manager, sqlite_manager)   # có lại clip_embedder mặc định
 reranker = Reranker(sqlite_manager)
 llm_client = GroqClient() if os.environ.get("GROQ_API_KEY") else None
 pipeline = RagPipeline(retriever, reranker, llm_client=llm_client)
