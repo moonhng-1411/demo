@@ -5,7 +5,6 @@ Mặc định các path đều tính từ thư mục gốc project (nơi chạy 
 import os
 
 DB_PATH = os.environ.get("AIC_DB_PATH", "data/aic.sqlite")
-KEYFRAME_ROOT = os.environ.get("AIC_KEYFRAME_ROOT", "data/keyframes")
 INDEX_ROOT = os.environ.get("AIC_INDEX_ROOT", "data/index")
 
 os.makedirs(INDEX_ROOT, exist_ok=True)

@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from dataclasses import dataclass, replace, asdict
 
 import numpy as np
@@ -12,10 +13,12 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 class Candidate:
     """Một kết quả retrieval thô, trước khi fusion.
 
-    modality: "caption" | "asr" | "visual" (từ FAISS) | "fused" (sau merge()).
+    ``frame_id`` chỉ dùng nội bộ để join database; ``frame_idx`` là chỉ số
+    frame theo video và là field công khai cho frontend.
     """
     frame_id: int
     video_id: str
+    frame_idx: int
     timestamp: float
     score: float
     modality: str
@@ -34,63 +37,112 @@ class TextEmbedder:
 
 
 class ClipQueryEmbedder:
-    """Encode câu truy vấn text sang vector CLIP (512-dim) đúng KHỚP không
-    gian embedding BTC dùng lúc build faiss_clip.index -- open_clip OpenAI
-    ViT-B/32 checkpoint, KHÔNG dùng sentence-transformers wrapper (đã xác
-    nhận sai không gian, verify ra 0/10)."""
+    """Encode câu truy vấn text sang vector CLIP (512-dim), dùng cho
+    faiss_clip.index (ảnh keyframe) -- cùng không gian embedding với ảnh
+    nên có thể query text -> ảnh trực tiếp."""
 
-    def __init__(self, device: str = "cpu"):
-        import open_clip
+    def __init__(self, model_name="ViT-B-32", pretrained="openai", device="cpu"):
+        # Phải khớp scripts/14_search_clip.py của pipeline nguồn.
+        # Không dùng SentenceTransformer("clip-ViT-B-32") ở đây vì đó là
+        # encoder implementation/checkpoint khác với OpenCLIP dùng để search.
         self.device = device
-        self.model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
-        self.tokenizer = open_clip.get_tokenizer("ViT-B-32")
+        self.model, _, _ = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained
+        )
+        self.tokenizer = open_clip.get_tokenizer(model_name)
         self.model.to(device).eval()
 
     def encode(self, text: str) -> np.ndarray:
-        """Trả về vector đã L2-normalize (khớp cách build index: inner product
-        trên vector đã normalize = cosine similarity)."""
-        import torch
         with torch.no_grad():
             tokens = self.tokenizer([text]).to(self.device)
-            vec = self.model.encode_text(tokens)
-            vec = vec / vec.norm(dim=-1, keepdim=True)
-        return vec.cpu().numpy().astype("float32")[0]
+            vector = self.model.encode_text(tokens)
+            vector = vector / vector.norm(dim=-1, keepdim=True)
+        return vector.cpu().numpy().astype("float32")[0]
 
 
 class Retriever:
+    """Gộp kết quả từ 2 FAISS index (text: caption+asr, clip: ảnh) thành
+    1 dict {modality: [Candidate]} để đưa vào fusion."""
+
     def __init__(self, faiss_manager, sqlite_manager, text_embedder=None, clip_embedder=None):
         self.faiss_manager = faiss_manager
         self.sqlite_manager = sqlite_manager
         self.text_embedder = text_embedder or TextEmbedder()
         self.clip_embedder = clip_embedder or ClipQueryEmbedder()
 
-    def _text_candidate(self, entry, modality, score):
-        frame_id = (
-            self.sqlite_manager.resolve_transcript_to_frame(entry["transcript_id"])
-            if modality == "asr" else entry["keyframe_id"]
+    def _text_candidate(self, entry: dict, modality: str, score: float) -> Candidate:
+        """Chuyển một hit text thành Candidate.
+
+        ASR metadata hiện tại có ``video_id``, ``start_s`` và ``end_s`` nhưng
+        không có ``transcript_id``. Vẫn hỗ trợ schema cũ nếu entry có
+        transcript_id để không phá các index cũ.
+        """
+        if modality == "asr":
+            transcript_id = entry.get("transcript_id")
+            if transcript_id is not None:
+                frame_id = self.sqlite_manager.resolve_transcript_to_frame(transcript_id)
+            else:
+                required = ("video_id", "start_s", "end_s")
+                missing = [key for key in required if entry.get(key) is None]
+                if missing:
+                    raise KeyError("ASR metadata thiếu trường " + ", ".join(missing))
+                frame_id = self.sqlite_manager.resolve_asr_to_frame(
+                    entry["video_id"], entry["start_s"], entry["end_s"]
+                )
+        else:
+            frame_id = entry.get("keyframe_id")
+            if frame_id is None:
+                raise KeyError("caption metadata thiếu keyframe_id")
+
+        info = self.sqlite_manager.get_frame_info(int(frame_id))
+        return Candidate(
+            int(frame_id), info["video_id"], info["frame_idx"], info["pts_time"],
+            float(score), modality,
         )
-        info = self.sqlite_manager.get_frame_info(frame_id)
-        return Candidate(frame_id, info["video_id"], info["pts_time"], float(score), modality)
 
-    def _visual_candidate(self, frame_id, score):
+    def _visual_candidate(self, frame_id: int, score: float) -> Candidate:
+        """Chuyển 1 hit từ faiss_clip.index (đã map sẵn ra keyframe_id qua
+        clip_id_map.npy) thành Candidate."""
         info = self.sqlite_manager.get_frame_info(frame_id)
-        return Candidate(frame_id, info["video_id"], info["pts_time"], float(score), "visual")
+        return Candidate(
+            int(frame_id), info["video_id"], info["frame_idx"], info["pts_time"],
+            float(score), "visual",
+        )
 
-    def search(self, query, top_k=50):
+    def search(self, query: str, top_k: int = 50) -> dict:
+        """Truy vấn cả hai index text và CLIP."""
         results = {"caption": [], "asr": [], "visual": []}
+        profile = os.environ.get("RAG_PROFILE", "0") == "1"
+        started = time.perf_counter()
 
         text_vec = self.text_embedder.encode(query)
+        text_encoded = time.perf_counter()
         for entry, modality, score in self.faiss_manager.search_text(text_vec, top_k=top_k):
             results[modality].append(self._text_candidate(entry, modality, score))
+        text_searched = time.perf_counter()
 
         clip_vec = self.clip_embedder.encode(query)
+        clip_encoded = time.perf_counter()
         for frame_id, score in self.faiss_manager.search_clip(clip_vec, top_k=top_k):
             results["visual"].append(self._visual_candidate(frame_id, score))
+        finished = time.perf_counter()
 
+        if profile:
+            print(
+                "[RAG_PROFILE] "
+                f"text_encode={text_encoded-started:.2f}s "
+                f"text_search_map={text_searched-text_encoded:.2f}s "
+                f"clip_encode={clip_encoded-text_searched:.2f}s "
+                f"clip_search_map={finished-clip_encoded:.2f}s "
+                f"total_retrieve={finished-started:.2f}s"
+            )
         return results
 
-    def search_events(self, events, top_k=50):
+    def search_events(self, events: list[str], top_k: int = 50) -> list[dict]:
+        """Dùng cho TRAKE -- search riêng từng event, giữ đúng thứ tự events
+        truyền vào (không được sắp xếp lại)."""
         return [self.search(e, top_k=top_k) for e in events]
+
 
 DEFAULT_MODALITY_WEIGHTS = {"caption": 1.0, "asr": 0.8, "visual": 1.0}
 DEFAULT_OBJECT_WEIGHT = 0.5
@@ -155,10 +207,14 @@ def merge(candidates_by_modality: dict, query: str = None, sqlite_manager=None,
 
 @dataclass
 class RerankedResult:
-    """Kết quả sau cross-encoder rerank -- document_text giữ lại để
-    prompt_builder dùng làm ngữ cảnh cho LLM ở bước Q&A."""
+    """Kết quả nội bộ sau cross-encoder rerank.
+
+    ``frame_id`` giữ lại để lấy caption/ASR và ảnh; response API sẽ loại field
+    này và chỉ công khai video_id, frame_idx, score.
+    """
     frame_id: int
     video_id: str
+    frame_idx: int
     timestamp: float
     rerank_score: float
     document_text: str
@@ -204,8 +260,9 @@ class Reranker:
         pairs = [(query, d) for _, d in valid]
         scores = [float(s) for s in self.cross_encoder.predict(pairs)]
 
-        results = [RerankedResult(c.frame_id, c.video_id, c.timestamp, score, d)
-                   for (c, d), score in zip(valid, scores)]
+        results = [RerankedResult(
+            c.frame_id, c.video_id, c.frame_idx, c.timestamp, score, d
+        ) for (c, d), score in zip(valid, scores)]
         results.sort(key=lambda r: r.rerank_score, reverse=True)
         return results[:top_n]
 
@@ -268,19 +325,51 @@ class RagPipeline:
     """Điều phối toàn bộ flow retrieve -> fuse -> rerank -> (LLM nếu cần),
     theo 3 loại truy vấn của AIC: KIS, QA/VQA, TRAKE."""
 
-    def __init__(self, retriever, reranker, llm_client=None, top_k_retrieve=50, top_n_rerank=10):
+    @staticmethod
+    def _public_result(result: RerankedResult) -> dict:
+        """Response sau CrossEncoder; không lộ keyframe_id nội bộ."""
+        return {
+            "video_id": result.video_id,
+            "frame_idx": result.frame_idx,
+            "score": float(result.rerank_score),
+        }
+
+    @staticmethod
+    def _public_candidate(candidate: Candidate) -> dict:
+        """Response nhanh dùng điểm fusion, không chạy CrossEncoder."""
+        return {
+            "video_id": candidate.video_id,
+            "frame_idx": candidate.frame_idx,
+            "score": float(candidate.score),
+        }
+
+    def __init__(self, retriever, reranker, llm_client=None, top_k_retrieve=50,
+                 top_n_rerank=10, fast_kis=False):
         self.retriever = retriever
         self.reranker = reranker
         self.llm_client = llm_client  # None hợp lệ nếu chỉ dùng KIS
         self.top_k_retrieve = top_k_retrieve
         self.top_n_rerank = top_n_rerank
+        self.fast_kis = fast_kis
 
     def run_kis(self, query: str) -> list[dict]:
-        """Known-Item Search -- dừng lại ở rerank, không gọi LLM, để giảm
-        độ trễ (yêu cầu quan trọng cho KIS trong thi AIC)."""
+        """KIS; có thể bỏ CrossEncoder bằng ``RAG_FAST_KIS=1``."""
+        started = time.perf_counter()
         cands = self.retriever.search(query, top_k=self.top_k_retrieve)
         fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager)
-        return [asdict(r) for r in self.reranker.rerank(query, fused, top_n=self.top_n_rerank)]
+        if self.fast_kis:
+            results = [self._public_candidate(c) for c in fused[:self.top_n_rerank]]
+        else:
+            results = [self._public_result(r)
+                       for r in self.reranker.rerank(
+                           query, fused, top_n=self.top_n_rerank
+                       )]
+        if os.environ.get("RAG_PROFILE", "0") == "1":
+            print(
+                f"[RAG_PROFILE] total_kis={time.perf_counter()-started:.2f}s "
+                f"fast_kis={self.fast_kis} results={len(results)}"
+            )
+        return results
 
     def run_qa(self, query: str) -> dict:
         """Q&A/VQA -- đi tiếp bước gọi LLM sinh câu trả lời tự nhiên,
@@ -291,7 +380,7 @@ class RagPipeline:
         fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager)
         reranked = self.reranker.rerank(query, fused, top_n=self.top_n_rerank)
         return {"answer": build_qa_answer(query, reranked, self.llm_client),
-                "sources": [asdict(r) for r in reranked]}
+                "sources": [self._public_result(r) for r in reranked]}
 
     def run_trake(self, events: list[str]) -> list[list[dict]]:
         """TRAKE (multi-event/temporal) -- search+rerank riêng từng event,
@@ -300,7 +389,7 @@ class RagPipeline:
         fused_per_event = [merge(c, query=e, sqlite_manager=self.retriever.sqlite_manager)
                             for c, e in zip(cands_per_event, events)]
         reranked = self.reranker.rerank_events(events, fused_per_event, top_n=self.top_n_rerank)
-        return [[asdict(r) for r in ev] for ev in reranked]
+        return [[self._public_result(r) for r in ev] for ev in reranked]
 
     def run(self, query_type: str, query: str = None, events: list[str] = None):
         """Entry point chung, chọn nhánh xử lý theo query_type ("KIS"|"QA"|"VQA"|"TRAKE")."""

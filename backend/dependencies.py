@@ -1,6 +1,7 @@
 """Khởi tạo các object dùng chung (SqliteManager, FaissManager, RagPipeline)
 1 lần duy nhất lúc app start -- routers import từ đây, không tự tạo lại."""
 
+import inspect
 import os
 from datetime import timedelta
 from minio import Minio
@@ -23,18 +24,31 @@ faiss_manager = FaissManager(
     text_index_path=f"{INDEX_ROOT}/faiss_text.index",
     text_metadata_path=f"{INDEX_ROOT}/text_embedding_metadata.jsonl",
     clip_index_path=f"{INDEX_ROOT}/faiss_clip.index",
-    clip_id_map_path=f"{INDEX_ROOT}/id_map.json",   # đổi từ clip_id_map.npy
+    clip_id_map_path=CLIP_ID_MAP_PATH,
 )
-retriever = Retriever(faiss_manager, sqlite_manager)   # có lại clip_embedder mặc định
+retriever = Retriever(faiss_manager, sqlite_manager)
 reranker = Reranker(sqlite_manager)
 llm_client = GroqClient() if os.environ.get("GROQ_API_KEY") else None
-pipeline = RagPipeline(retriever, reranker, llm_client=llm_client)
+# 20 mỗi modality thường đủ cho KIS và giảm đáng kể số cặp đưa vào CrossEncoder.
+# Có thể tăng lên 30/50 nếu ưu tiên recall hơn tốc độ.
+TOP_K_RETRIEVE = int(os.environ.get("RAG_TOP_K_RETRIEVE", "20"))
+FAST_KIS = os.environ.get("RAG_FAST_KIS", "0") == "1"
+pipeline_kwargs = {
+    "llm_client": llm_client,
+    "top_k_retrieve": TOP_K_RETRIEVE,
+}
+if "fast_kis" in inspect.signature(RagPipeline).parameters:
+    pipeline_kwargs["fast_kis"] = FAST_KIS
+else:
+    print("[WARN] pipeline.py chưa hỗ trợ fast_kis; đang chạy compatibility mode. Hãy cập nhật pipeline.py để bật RAG_FAST_KIS.")
+pipeline = RagPipeline(retriever, reranker, **pipeline_kwargs)
 
+MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").lower() in {"1", "true", "yes", "on"}
 minio_public_client = Minio(
-    os.environ.get("MINIO_PUBLIC_ENDPOINT", "localhost:9000"),
+    os.environ.get("MINIO_PUBLIC_ENDPOINT", os.environ.get("MINIO_ENDPOINT", "localhost:9000")),
     access_key=os.environ["MINIO_ACCESS_KEY"],
     secret_key=os.environ["MINIO_SECRET_KEY"],
-    secure=False,
+    secure=MINIO_SECURE,
 )
 
 
@@ -51,6 +65,7 @@ def get_minio_client() -> Minio:
     return minio_public_client
 
 
-def presigned_keyframe_url(bucket: str, key: str) -> str:
-    """Sinh presigned URL cho 1 ảnh keyframe trên MinIO, hết hạn sau 1h."""
-    return minio_public_client.presigned_get_object(bucket, key, expires=timedelta(hours=1))
+def presigned_keyframe_url(bucket: str, key: str, client: Minio | None = None) -> str:
+    """Sinh presigned URL bằng đúng public client dùng cho endpoint media."""
+    signer = client or minio_public_client
+    return signer.presigned_get_object(bucket, key, expires=timedelta(hours=1))

@@ -1,6 +1,8 @@
 """Điểm vào giao diện -- chỉ còn control flow, logic UI/API đã tách sang
 components.py / api.py / styles.py."""
 
+import time
+
 import streamlit as st
 from api import AicApiClient
 from components import (
@@ -24,8 +26,17 @@ if mode == "KIS":
     if query:
         with st.spinner("Đang tìm..."):
             try:
+                started = time.perf_counter()
                 results = api.search_kis(query, top_n=top_n)
+                api_elapsed = time.perf_counter() - started
+                timing = st.empty()
+                timing.caption(f"Thời gian truy vấn API: {api_elapsed:.2f} giây")
                 render_results(results, api, n_cols)
+                total_elapsed = time.perf_counter() - started
+                timing.caption(
+                    f"Thời gian API: {api_elapsed:.2f} giây · "
+                    f"Tổng thời gian gồm tải ảnh: {total_elapsed:.2f} giây"
+                )
             except Exception as e:
                 st.error(str(e))
 
@@ -34,10 +45,19 @@ elif mode == "Q&A":
     if query:
         with st.spinner("Đang suy nghĩ..."):
             try:
+                started = time.perf_counter()
                 data = api.ask_qa(query, top_n=top_n)
+                api_elapsed = time.perf_counter() - started
+                timing = st.empty()
+                timing.caption(f"Thời gian truy vấn API: {api_elapsed:.2f} giây")
                 st.markdown(f"### Trả lời\n{data['answer']}")
                 st.divider()
                 render_results(data["sources"], api, n_cols)
+                total_elapsed = time.perf_counter() - started
+                timing.caption(
+                    f"Thời gian API: {api_elapsed:.2f} giây · "
+                    f"Tổng thời gian gồm tải ảnh: {total_elapsed:.2f} giây"
+                )
             except Exception as e:
                 st.error(str(e))
 
@@ -46,10 +66,19 @@ elif mode == "TRAKE":
     if events:
         with st.spinner("Đang tìm..."):
             try:
+                started = time.perf_counter()
                 results_per_event = api.search_trake(events, top_n=top_n)
+                api_elapsed = time.perf_counter() - started
+                timing = st.empty()
+                timing.caption(f"Thời gian truy vấn API: {api_elapsed:.2f} giây")
                 for event_text, event_results in zip(events, results_per_event):
                     st.subheader(f"📌 {event_text}")
                     render_results(event_results, api, n_cols)
                     st.divider()
+                total_elapsed = time.perf_counter() - started
+                timing.caption(
+                    f"Thời gian API: {api_elapsed:.2f} giây · "
+                    f"Tổng thời gian gồm tải ảnh: {total_elapsed:.2f} giây"
+                )
             except Exception as e:
                 st.error(str(e))

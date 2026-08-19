@@ -3,6 +3,7 @@
 cho 1 keyframe cụ thể. Được Retriever và Reranker dùng chung."""
 
 import sqlite3
+from functools import lru_cache
 
 
 class SqliteManager:
@@ -15,37 +16,72 @@ class SqliteManager:
     def _conn(self):
         return self._conn_obj
 
+    @lru_cache(maxsize=8192)
     def get_frame_info(self, frame_id: int) -> dict:
-        """Trả về video_id, pts_time, và thông tin ảnh (s3_bucket/s3_key/file_name)
-        cho 1 keyframe_id. Raise KeyError nếu frame_id không tồn tại."""
+        """Trả metadata của một keyframe.
+
+        ``id`` là keyframe_id toàn cục dùng để truy vấn database; ``n`` là số
+        thứ tự keyframe trong video dùng để dựng tên ảnh MinIO; ``frame_idx`` là
+        chỉ số frame theo video và là trường được trả ra cho frontend.
+        """
         row = self._conn().execute(
-            "SELECT video_id, pts_time, s3_bucket, s3_key, file_name "
+            "SELECT id, video_id, n, frame_idx, pts_time, s3_bucket, s3_key, file_name "
             "FROM keyframes WHERE id = ?", (frame_id,),
         ).fetchone()
         if row is None:
             raise KeyError(f"frame_id không tồn tại: {frame_id}")
         return dict(row)
 
+    def resolve_asr_to_frame(self, video_id: str, start_s: float, end_s: float) -> int:
+        """Map một ASR segment sang keyframe gần nhất trong cùng video.
+
+        Metadata JSONL hiện tại chỉ có ``video_id``, ``start_s`` và ``end_s``;
+        không có ``transcript_id``. Ưu tiên keyframe nằm trong segment, sau đó
+        fallback về keyframe gần điểm giữa segment để không làm hỏng toàn bộ
+        truy vấn khi sampling frame thưa.
+        """
+        video_id = str(video_id)
+        start_s = float(start_s)
+        end_s = float(end_s)
+        mid_s = (start_s + end_s) / 2.0
+
+        frame = self._conn().execute(
+            "SELECT id FROM keyframes "
+            "WHERE video_id = ? AND pts_time BETWEEN ? AND ? "
+            "ORDER BY ABS(pts_time - ?) LIMIT 1",
+            (video_id, start_s, end_s, mid_s),
+        ).fetchone()
+        if frame is None:
+            frame = self._conn().execute(
+                "SELECT id FROM keyframes WHERE video_id = ? "
+                "ORDER BY ABS(pts_time - ?) LIMIT 1",
+                (video_id, mid_s),
+            ).fetchone()
+        if frame is None:
+            raise KeyError(f"không tìm thấy keyframe cho video {video_id}")
+        return int(frame["id"])
+
     def resolve_transcript_to_frame(self, transcript_id: int) -> int:
-        """ASR không map 1-1 vào keyframe (1 segment có thể phủ nhiều frame) --
-        hàm này lấy mốc giữa (start_s+end_s)/2 của transcript rồi tìm keyframe
-        có pts_time gần nhất trong CÙNG video. Dùng khi Retriever xử lý hit
-        có modality == "asr" từ faiss_text.index."""
+        """Resolver tương thích ngược cho metadata cũ có transcript_id."""
         row = self._conn().execute(
-            "SELECT video_id, (start_s + end_s) / 2.0 AS mid_s FROM transcripts WHERE id = ?",
+            "SELECT video_id, start_s, end_s FROM transcripts WHERE id = ?",
             (transcript_id,),
         ).fetchone()
         if row is None:
             raise KeyError(f"transcript_id không tồn tại: {transcript_id}")
+        return self.resolve_asr_to_frame(row["video_id"], row["start_s"], row["end_s"])
 
-        frame = self._conn().execute(
-            "SELECT id FROM keyframes WHERE video_id = ? ORDER BY ABS(pts_time - ?) LIMIT 1",
-            (row["video_id"], row["mid_s"]),
+    def resolve_frame_position(self, video_id: str, frame_idx: int) -> int:
+        """Resolve video_id + frame_idx thành keyframe_id nội bộ cho endpoint ảnh."""
+        row = self._conn().execute(
+            "SELECT id FROM keyframes WHERE video_id = ? AND frame_idx = ? LIMIT 1",
+            (str(video_id), int(frame_idx)),
         ).fetchone()
-        if frame is None:
-            raise KeyError(f"không tìm thấy keyframe cho video {row['video_id']}")
-        return frame["id"]
+        if row is None:
+            raise KeyError(f"không tìm thấy frame_idx={frame_idx} trong video {video_id}")
+        return int(row["id"])
 
+    @lru_cache(maxsize=8192)
     def get_frame_objects(self, frame_id: int, min_score: float = 0.3) -> list[str]:
         """Trả về list nhãn object (entity) detect được trên frame, lọc theo
         score tối thiểu, sort giảm dần theo score. Dùng cho object_score trong
@@ -56,6 +92,7 @@ class SqliteManager:
         ).fetchall()
         return [r["entity"] for r in rows]
 
+    @lru_cache(maxsize=8192)
     def get_frame_texts(self, frame_id: int) -> dict:
         """Trả về {"caption_text", "ocr_text", "asr_text"} cho 1 frame, dùng
         để Reranker build document cho cross-encoder. asr_text lấy từ segment
