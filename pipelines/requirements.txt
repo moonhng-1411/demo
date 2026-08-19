@@ -1,0 +1,9 @@
+sentence-transformers
+faiss-cpu
+transformers
+torch
+faster-whisper
+yt-dlp
+minio
+numpy
+Pillow

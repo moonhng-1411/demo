@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+pydantic
+sentence-transformers
+faiss-cpu
+transformers
+torch
+faster-whisper
+yt-dlp
+groq
+minio
+numpy
+Pillow
