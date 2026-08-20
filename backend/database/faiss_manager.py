@@ -9,12 +9,41 @@ class FaissManager:
                  clip_index_path: str, clip_id_map_path: str):
         """clip_id_map_path giờ trỏ tới id_map.json (đã verify đúng, 18/20 hit),
         KHÔNG dùng clip_id_map.npy tự build (đã xác nhận sai)."""
+        resolved_text_metadata_path = self._resolve_text_metadata_path(text_metadata_path)
+        required_files = {
+            "text FAISS index": text_index_path,
+            "text metadata": resolved_text_metadata_path,
+            "CLIP FAISS index": clip_index_path,
+            "CLIP id map": clip_id_map_path,
+        }
+        missing = [
+            f"{label}: {os.path.abspath(path)}"
+            for label, path in required_files.items()
+            if not os.path.isfile(path)
+        ]
+        if missing:
+            raise FileNotFoundError(
+                "Thiếu artifact dữ liệu bắt buộc:\n- " + "\n- ".join(missing)
+                + "\nHãy kiểm tra AIC_*_PATH trong .env và bảo đảm thư mục data/"
+                " chứa các file FAISS, metadata, id_map và SQLite trước khi chạy backend."
+            )
+
         self.text_index = faiss.read_index(text_index_path)
-        self.text_metadata = self._load_text_metadata(text_metadata_path)
+        if self.text_index.d != 512:
+            raise ValueError(
+                f"faiss_text.index có dim={self.text_index.d}; "
+                "manifest yêu cầu CLIP ViT-B/32 dim=512"
+            )
+        self.text_metadata = self._load_text_metadata(resolved_text_metadata_path)
         assert self.text_index.ntotal == len(self.text_metadata), \
             "faiss_text.index và metadata lệch số dòng"
 
         self.clip_index = faiss.read_index(clip_index_path)
+        if self.clip_index.d != 512:
+            raise ValueError(
+                f"faiss_clip.index có dim={self.clip_index.d}; "
+                "manifest yêu cầu CLIP ViT-B/32 dim=512"
+            )
         self.clip_id_map = self._load_id_map(clip_id_map_path)
         assert self.clip_index.ntotal == len(self.clip_id_map), \
             "faiss_clip.index và clip id map lệch số dòng"

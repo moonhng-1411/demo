@@ -1,9 +1,11 @@
 """Điểm vào giao diện -- chỉ còn control flow, logic UI/API đã tách sang
 components.py / api.py / styles.py."""
 
+import os
 import time
 
 import streamlit as st
+from dotenv import load_dotenv
 from api import AicApiClient
 from components import (
     render_sidebar,
@@ -14,11 +16,14 @@ from components import (
 )
 from styles import inject_css
 
+load_dotenv()
+
 st.set_page_config(page_title="AIC26 Video Retrieval", layout="wide", page_icon="🎥")
 inject_css(st)
 st.title("🎥 AIC26 — Video Retrieval")
 
-api = AicApiClient(st.secrets.get("API_URL", "http://localhost:8000"))
+API_URL = os.environ.get("API_URL") or st.secrets.get("API_URL", "http://localhost:8000")
+api = AicApiClient(API_URL)
 mode, top_n, n_cols, translate = render_sidebar()
 
 # Cache kết quả truy vấn gần nhất mỗi mode vào session_state. Cần thiết vì

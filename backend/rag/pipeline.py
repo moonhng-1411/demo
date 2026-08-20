@@ -4,6 +4,9 @@ import time
 from dataclasses import dataclass, replace, asdict
 
 import numpy as np
+import torch
+import torch.nn.functional as F
+import open_clip
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 
@@ -30,12 +33,40 @@ class TextEmbedder:
     (caption + asr gộp chung).
     """
 
+    """
     def __init__(self, model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", device="cpu"):
         self.model = SentenceTransformer(model_name, device=device)
 
     def encode(self, text: str) -> np.ndarray:
-        """Trả về vector float32 đã normalize (để dùng inner product = cosine)."""
+        Trả về vector float32 đã normalize (để dùng inner product = cosine).
         return np.asarray(self.model.encode(text, normalize_embeddings=True), dtype="float32")
+    """
+    MODEL_NAME = "ViT-B-32"
+    PRETRAINED = "openai"
+
+    def __init__(
+        self,
+        model_name: str | None = None,
+        pretrained: str | None = None,
+        device: str = "cpu",
+    ):
+        self.model_name = model_name or self.MODEL_NAME
+        self.pretrained = pretrained or self.PRETRAINED
+        self.device = device
+        self.model, _, _ = open_clip.create_model_and_transforms(
+            self.model_name,
+            pretrained=self.pretrained,
+            device=device,
+        )
+        self.tokenizer = open_clip.get_tokenizer(self.model_name)
+        self.model.eval()
+
+    @torch.inference_mode()
+    def encode(self, text: str) -> np.ndarray:
+        tokens = self.tokenizer([text]).to(self.device)
+        vector = self.model.encode_text(tokens)
+        vector = F.normalize(vector.float(), p=2, dim=-1)
+        return vector[0].detach().cpu().numpy().astype("float32")
 
 
 class ClipQueryEmbedder:

@@ -153,18 +153,7 @@ Có thể chạy backend ngay từ **thư mục gốc** `D:\aic2026`. Dùng `--a
 Mở PowerShell thứ nhất:
 
 ```
-python.exe -m uvicorn main:app `
-  --app-dir backend `
-  --env-file D:\aic2026\.env `
-  --host 0.0.0.0 `
-  --port 8000 `
-  --reload
-```
-
-Nếu virtual environment đã được activate:
-
-```
-python -m uvicorn main:app --app-dir backend --env-file D:\aic2026\.env --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn main:app --app-dir backend --env-file .env --host 0.0.0.0 --port 8000 --reload
 ```
 
 

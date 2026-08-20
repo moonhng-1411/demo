@@ -4,26 +4,49 @@
 import inspect
 import os
 from datetime import timedelta
+from pathlib import Path
 from minio import Minio
 
 from database.sqlite_manager import SqliteManager
 from database.faiss_manager import FaissManager
-from rag.pipeline import Retriever, Reranker, RagPipeline, GroqClient, QueryTranslator, QueryRewriter
+from rag.pipeline import Retriever, Reranker, RagPipeline, GroqClient, QueryTranslator, QueryRewriter, TextEmbedder
 
-DB_PATH = os.environ.get("AIC_DB_PATH", "data/aic.sqlite")
-INDEX_ROOT = os.environ.get("AIC_INDEX_ROOT", "data/index")
-_DEFAULT_JSON_MAP = f"{INDEX_ROOT}/id_map.json"
-_DEFAULT_NPY_MAP = f"{INDEX_ROOT}/clip_id_map.npy"
-CLIP_ID_MAP_PATH = os.environ.get(
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _runtime_path(env_name: str, default: str) -> str:
+    """Resolve relative paths from the project root, not the process CWD.
+
+    Uvicorn may be started with ``--app-dir backend`` from another directory;
+    resolving here keeps ``data/index`` stable on both Windows and Linux.
+    Absolute paths supplied through .env remain unchanged.
+    """
+    raw = os.environ.get(env_name, default)
+    if os.path.isabs(raw):
+        return raw
+    return str(PROJECT_ROOT / raw)
+
+
+DB_PATH = _runtime_path("AIC_DB_PATH", "data/aic.sqlite")
+INDEX_ROOT = _runtime_path("AIC_INDEX_ROOT", "data/index")
+_DEFAULT_JSON_MAP = os.path.join(INDEX_ROOT, "id_map.json")
+_DEFAULT_NPY_MAP = os.path.join(INDEX_ROOT, "clip_id_map.npy")
+CLIP_ID_MAP_PATH = _runtime_path(
     "AIC_CLIP_ID_MAP_PATH",
     _DEFAULT_JSON_MAP if os.path.exists(_DEFAULT_JSON_MAP) else _DEFAULT_NPY_MAP,
 )
 
 sqlite_manager = SqliteManager(DB_PATH)
+TEXT_INDEX_PATH = _runtime_path("AIC_TEXT_INDEX_PATH", os.path.join(INDEX_ROOT, "faiss_text.index"))
+TEXT_METADATA_PATH = _runtime_path(
+    "AIC_TEXT_METADATA_PATH", os.path.join(INDEX_ROOT, "text_embedding_metadata.json")
+)
+CLIP_INDEX_PATH = _runtime_path("AIC_CLIP_INDEX_PATH", os.path.join(INDEX_ROOT, "faiss_clip.index"))
+
 faiss_manager = FaissManager(
-    text_index_path=f"{INDEX_ROOT}/faiss_text.index",
-    text_metadata_path=f"{INDEX_ROOT}/text_embedding_metadata.jsonl",
-    clip_index_path=f"{INDEX_ROOT}/faiss_clip.index",
+    text_index_path=TEXT_INDEX_PATH,
+    text_metadata_path=TEXT_METADATA_PATH,
+    clip_index_path=CLIP_INDEX_PATH,
     clip_id_map_path=CLIP_ID_MAP_PATH,
 )
 
@@ -51,7 +74,24 @@ query_rewriter = (
     QueryRewriter() if TRANSLATE_QUERY and os.environ.get("GROQ_API_KEY") else None
 )
 
-retriever = Retriever(faiss_manager, sqlite_manager, translator=query_translator, rewriter=query_rewriter)
+# Cả hai index đều nằm trong CLIP:ViT-B-32:openai, dim=512 theo manifest.
+# Dùng chung một model instance để tránh nạp hai checkpoint giống nhau vào RAM.
+CLIP_MODEL_NAME = os.environ.get("AIC_CLIP_MODEL", TextEmbedder.MODEL_NAME)
+CLIP_PRETRAINED = os.environ.get("AIC_CLIP_PRETRAINED", TextEmbedder.PRETRAINED)
+EMBED_DEVICE = os.environ.get("AIC_EMBED_DEVICE", "cpu")
+clip_text_embedder = TextEmbedder(
+    model_name=CLIP_MODEL_NAME,
+    pretrained=CLIP_PRETRAINED,
+    device=EMBED_DEVICE,
+)
+retriever = Retriever(
+    faiss_manager,
+    sqlite_manager,
+    text_embedder=clip_text_embedder,
+    clip_embedder=clip_text_embedder,
+    translator=query_translator,
+    rewriter=query_rewriter,
+)
 reranker = Reranker(sqlite_manager)
 llm_client = GroqClient() if os.environ.get("GROQ_API_KEY") else None
 # 20 mỗi modality thường đủ cho KIS và giảm đáng kể số cặp đưa vào CrossEncoder.

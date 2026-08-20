@@ -7,6 +7,7 @@ pydantic
 sentence-transformers
 faiss-cpu
 transformers
+open_clip_torch
 torch
 faster-whisper
 yt-dlp
