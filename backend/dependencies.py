@@ -8,7 +8,7 @@ from minio import Minio
 
 from database.sqlite_manager import SqliteManager
 from database.faiss_manager import FaissManager
-from rag.pipeline import Retriever, Reranker, RagPipeline, GroqClient
+from rag.pipeline import Retriever, Reranker, RagPipeline, GroqClient, QueryTranslator
 
 DB_PATH = os.environ.get("AIC_DB_PATH", "data/aic.sqlite")
 INDEX_ROOT = os.environ.get("AIC_INDEX_ROOT", "data/index")
@@ -26,7 +26,21 @@ faiss_manager = FaissManager(
     clip_index_path=f"{INDEX_ROOT}/faiss_clip.index",
     clip_id_map_path=CLIP_ID_MAP_PATH,
 )
-retriever = Retriever(faiss_manager, sqlite_manager)
+
+# Dịch query VI->EN để khớp trực tiếp với caption/object label (chủ yếu
+# tiếng Anh) thay vì chỉ trông chờ khả năng cross-lingual của multilingual
+# embedder/cross-encoder. Tắt bằng cách không set GROQ_API_KEY hoặc set
+# RAG_TRANSLATE_QUERY=0 -- Retriever/Reranker đều xử lý translator=None
+# một cách an toàn (bỏ qua bước dịch, không lỗi).
+TRANSLATE_QUERY = os.environ.get("RAG_TRANSLATE_QUERY", "1") == "1"
+query_translator = (
+    QueryTranslator() if TRANSLATE_QUERY and os.environ.get("GROQ_API_KEY") else None
+)
+if TRANSLATE_QUERY and query_translator is None:
+    print("[WARN] RAG_TRANSLATE_QUERY=1 nhưng thiếu GROQ_API_KEY -- bỏ qua dịch query, "
+          "chạy như cũ (chỉ multilingual embedder/cross-encoder).")
+
+retriever = Retriever(faiss_manager, sqlite_manager, translator=query_translator)
 reranker = Reranker(sqlite_manager)
 llm_client = GroqClient() if os.environ.get("GROQ_API_KEY") else None
 # 20 mỗi modality thường đủ cho KIS và giảm đáng kể số cặp đưa vào CrossEncoder.

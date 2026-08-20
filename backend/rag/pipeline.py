@@ -62,15 +62,60 @@ class ClipQueryEmbedder:
         return np.asarray(vector, dtype="float32")
 
 
+class QueryTranslator:
+    """Dịch query tiếng Việt sang tiếng Anh bằng Groq LLM (share client
+    kiểu GroqClient) để tăng độ khớp trực tiếp với caption/object label
+    vốn toàn tiếng Anh, thay vì chỉ trông chờ khả năng cross-lingual của
+    multilingual embedder/cross-encoder (docstring Reranker đã cảnh báo
+    khả năng này không đáng tin cậy).
+
+    Lỗi dịch (Groq timeout/rate-limit) KHÔNG được làm hỏng pipeline --
+    luôn fallback về chỉ dùng query gốc nếu translate() raise exception,
+    xử lý ở nơi gọi (Retriever.search / Reranker.rerank), không phải ở đây.
+    """
+    SYSTEM_PROMPT = (
+        "Translate the Vietnamese search query into concise, natural "
+        "English suitable for matching against English image captions "
+        "and object labels. Output ONLY the translated text -- no "
+        "quotes, no explanation."
+    )
+
+    def __init__(self, api_key=None, model=None):
+        from groq import Groq
+        self.client = Groq(api_key=api_key or os.environ.get("GROQ_API_KEY"))
+        self.model = model or GroqClient.DEFAULT_MODEL
+        self._cache: dict[str, str] = {}  # tránh dịch lại cùng 1 query nhiều lần
+        # (vd Retriever.search rồi Reranker.rerank gọi cùng query, hoặc
+        # search_events/rerank_events lặp qua nhiều event khác nhau).
+
+    def translate(self, text: str) -> str:
+        if text in self._cache:
+            return self._cache[text]
+        r = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": self.SYSTEM_PROMPT},
+                      {"role": "user", "content": text}],
+            temperature=0.0, max_tokens=128,
+        )
+        translated = r.choices[0].message.content.strip()
+        self._cache[text] = translated
+        return translated
+
+
 class Retriever:
     """Gộp kết quả từ 2 FAISS index (text: caption+asr, clip: ảnh) thành
     1 dict {modality: [Candidate]} để đưa vào fusion."""
 
-    def __init__(self, faiss_manager, sqlite_manager, text_embedder=None, clip_embedder=None):
+    _SPLIT_RE = re.compile(r"[,;]|(?:\bvà\b)|(?:\bvới\b)|(?:\btrong khi\b)", re.IGNORECASE)
+    _LONG_QUERY_TOKEN_THRESHOLD = 12
+
+    def __init__(self, faiss_manager, sqlite_manager, text_embedder=None,
+                 clip_embedder=None, translator=None):
         self.faiss_manager = faiss_manager
         self.sqlite_manager = sqlite_manager
         self.text_embedder = text_embedder or TextEmbedder()
         self.clip_embedder = clip_embedder or ClipQueryEmbedder()
+        self.translator = translator  # None hợp lệ -- bỏ qua bước dịch nếu không truyền vào
 
     def _text_candidate(self, entry: dict, modality: str, score: float) -> Candidate:
         """Chuyển một hit text thành Candidate.
@@ -111,8 +156,29 @@ class Retriever:
             float(score), "visual",
         )
 
+    def _split_clauses(self, query: str) -> list[str]:
+        """Tách câu dài thành các cụm ngắn theo dấu câu/liên từ tiếng Việt.
+        Mỗi cụm được search riêng để tránh semantic dilution khi encode cả
+        câu dài thành 1 vector duy nhất (hạn chế cố hữu của dense
+        single-vector retrieval với câu nhiều chi tiết)."""
+        parts = [p.strip() for p in self._SPLIT_RE.split(query) if p and p.strip()]
+        return [p for p in parts if len(_tokenize(p)) >= 2]
+
     def search(self, query: str, top_k: int = 50) -> dict:
-        """Truy vấn cả hai index text và CLIP."""
+        """Truy vấn cả hai index text và CLIP.
+
+        Ngoài search bằng câu gốc, còn:
+        - search thêm bằng bản dịch tiếng Anh (nếu có translator) -- vì
+          caption/object label trong hệ thống chủ yếu tiếng Anh, khớp trực
+          tiếp đáng tin hơn là dựa vào khả năng cross-lingual của multilingual
+          embedder.
+        - với câu dài (>_LONG_QUERY_TOKEN_THRESHOLD token), search thêm theo
+          từng clause tách nhỏ (xem _split_clauses).
+        Các lượt search phụ này được cộng thêm vào cùng results[modality],
+        nhân với hệ số <1 để câu gốc/bản dịch đầy đủ vẫn có ưu tiên cao hơn.
+        merge() ở dưới sẽ dedupe theo frame_id trước khi tính RRF, nên
+        trùng lặp giữa các lượt search không làm hỏng thứ hạng.
+        """
         results = {"caption": [], "asr": [], "visual": []}
         profile = os.environ.get("RAG_PROFILE", "0") == "1"
         started = time.perf_counter()
@@ -129,6 +195,34 @@ class Retriever:
             results["visual"].append(self._visual_candidate(frame_id, score))
         finished = time.perf_counter()
 
+        translated = None
+        if self.translator is not None:
+            try:
+                translated = self.translator.translate(query)
+            except Exception as e:
+                translated = None
+                if profile:
+                    print(f"[RAG_PROFILE] translate lỗi, bỏ qua: {e}")
+
+        if translated:
+            en_text_vec = self.text_embedder.encode(translated)
+            for entry, modality, score in self.faiss_manager.search_text(en_text_vec, top_k=top_k):
+                results[modality].append(self._text_candidate(entry, modality, score * 0.9))
+            en_clip_vec = self.clip_embedder.encode(translated)
+            for frame_id, score in self.faiss_manager.search_clip(en_clip_vec, top_k=top_k):
+                results["visual"].append(self._visual_candidate(frame_id, score * 0.9))
+        translate_done = time.perf_counter()
+
+        if len(_tokenize(query)) > self._LONG_QUERY_TOKEN_THRESHOLD:
+            for clause in self._split_clauses(query):
+                clause_text_vec = self.text_embedder.encode(clause)
+                for entry, modality, score in self.faiss_manager.search_text(clause_text_vec, top_k=top_k // 2):
+                    results[modality].append(self._text_candidate(entry, modality, score * 0.7))
+                clause_clip_vec = self.clip_embedder.encode(clause)
+                for frame_id, score in self.faiss_manager.search_clip(clause_clip_vec, top_k=top_k // 2):
+                    results["visual"].append(self._visual_candidate(frame_id, score * 0.7))
+        clause_searched = time.perf_counter()
+
         if profile:
             print(
                 "[RAG_PROFILE] "
@@ -136,7 +230,9 @@ class Retriever:
                 f"text_search_map={text_searched-text_encoded:.2f}s "
                 f"clip_encode={clip_encoded-text_searched:.2f}s "
                 f"clip_search_map={finished-clip_encoded:.2f}s "
-                f"total_retrieve={finished-started:.2f}s"
+                f"translate_search={translate_done-finished:.2f}s "
+                f"clause_search={clause_searched-translate_done:.2f}s "
+                f"total_retrieve={clause_searched-started:.2f}s"
             )
         return results
 
@@ -152,21 +248,57 @@ RRF_K = 60  # hằng số chuẩn của Reciprocal Rank Fusion (Cormack et al.),
 
 
 def _tokenize(text: str) -> list[str]:
-    """Tách text thành list token chữ/số, lowercase -- dùng cho object score."""
+    """Tách text thành list token chữ/số, lowercase -- dùng cho object score
+    và _split_clauses."""
     return re.findall(r"\w+", text.lower())
 
 
-def _object_score(query: str, object_labels: list[str]) -> float:
-    """Tỉ lệ token trong query khớp với nhãn object detect được trên frame.
-    Trả về 0.0 nếu không có object hoặc query rỗng sau tokenize."""
+_LABEL_EMBED_CACHE: dict[str, np.ndarray] = {}
+
+
+def _label_embedding(label: str, embedder) -> np.ndarray:
+    """Cache embedding của từng nhãn object (chỉ ~521 nhãn distinct nên
+    cache toàn cục là đủ rẻ, không cần cache theo frame)."""
+    key = label.lower()
+    if key not in _LABEL_EMBED_CACHE:
+        _LABEL_EMBED_CACHE[key] = embedder.encode(label)
+    return _LABEL_EMBED_CACHE[key]
+
+
+def _object_score(query_vec: np.ndarray, object_labels: list[str], embedder,
+                   threshold: float = 0.35) -> float:
+    """Điểm khớp object = cosine similarity cao nhất giữa embedding query
+    (multilingual, đã encode 1 lần trong search()) và embedding từng nhãn
+    object (tiếng Anh, kiểu Open Images). Thay cho so khớp substring cũ:
+    substring luôn = 0 vì query tiếng Việt không bao giờ là chuỗi con của
+    nhãn tiếng Anh -- object detection vì vậy không đóng góp gì vào fusion
+    score trước đây, dù data detect vẫn đúng.
+    threshold để cắt các cặp similarity thấp/nhiễu về 0, tránh cộng điểm
+    ngẫu nhiên cho object không liên quan. Giá trị 0.35 là khởi điểm --
+    nên tune lại bằng cách log similarity thật trên vài trăm cặp
+    (query, label) của hệ thống."""
     if not object_labels:
         return 0.0
-    query_tokens = set(_tokenize(query))
-    if not query_tokens:
-        return 0.0
-    labels_joined = " ".join(l.lower() for l in object_labels)
-    matched = sum(1 for tok in query_tokens if tok in labels_joined)
-    return matched / len(query_tokens)
+    best = max(
+        float(np.dot(query_vec, _label_embedding(l, embedder)))
+        for l in object_labels
+    )
+    return best if best >= threshold else 0.0
+
+
+def _dedupe_by_frame(candidates: list) -> list:
+    """Trong 1 modality, 1 frame_id có thể xuất hiện nhiều lần (search
+    full-query + search bản dịch + search từng clause của câu dài). Giữ lại
+    candidate có score gốc cao nhất làm đại diện duy nhất, để _rrf_scores
+    tính rank trên list đã dedupe -- tránh occurrence rank thấp (từ clause/
+    bản dịch) ghi đè occurrence rank cao (từ full-query) khi build dict
+    theo frame_id."""
+    best_by_frame: dict[int, "Candidate"] = {}
+    for c in candidates:
+        prev = best_by_frame.get(c.frame_id)
+        if prev is None or c.score > prev.score:
+            best_by_frame[c.frame_id] = c
+    return list(best_by_frame.values())
 
 
 def _rrf_scores(ranked_frame_ids: list[int], k: int = RRF_K) -> dict:
@@ -176,10 +308,11 @@ def _rrf_scores(ranked_frame_ids: list[int], k: int = RRF_K) -> dict:
 
 
 def merge(candidates_by_modality: dict, query: str = None, sqlite_manager=None,
-          modality_weights: dict = None, object_weight: float = DEFAULT_OBJECT_WEIGHT) -> list:
+          text_embedder=None, modality_weights: dict = None,
+          object_weight: float = DEFAULT_OBJECT_WEIGHT) -> list:
     """Gộp candidate từ nhiều modality (caption/asr/visual) thành 1 list đã
     xếp hạng theo fused score = RRF theo từng modality (có trọng số) +
-    object_weight * object_score (nếu có query + sqlite_manager).
+    object_weight * object_score (nếu có query + sqlite_manager + text_embedder).
 
     Trả về list[Candidate] với modality="fused", sort giảm dần theo score.
     """
@@ -190,16 +323,22 @@ def merge(candidates_by_modality: dict, query: str = None, sqlite_manager=None,
     for modality, candidates in candidates_by_modality.items():
         if not candidates:
             continue
-        rrf = _rrf_scores([c.frame_id for c in candidates])
+        # sort theo score gốc trước khi tính rank: results[modality] hiện có
+        # thể chứa candidate từ nhiều lượt search nối tiếp nhau (full-query,
+        # bản dịch, từng clause) -- nếu không sort, RRF sẽ coi mọi candidate
+        # của lượt search đầu luôn rank cao hơn lượt sau bất kể score thật.
+        ranked = sorted(_dedupe_by_frame(candidates), key=lambda c: c.score, reverse=True)
+        rrf = _rrf_scores([c.frame_id for c in ranked])
         w = weights.get(modality, 1.0)
-        for c in candidates:
+        for c in ranked:
             frame_lookup.setdefault(c.frame_id, c)
             fused_scores[c.frame_id] = fused_scores.get(c.frame_id, 0.0) + w * rrf[c.frame_id]
 
-    if query and sqlite_manager is not None:
+    if query and sqlite_manager is not None and text_embedder is not None:
+        query_vec = text_embedder.encode(query)
         for fid in list(fused_scores.keys()):
             labels = sqlite_manager.get_frame_objects(fid)
-            fused_scores[fid] += object_weight * _object_score(query, labels)
+            fused_scores[fid] += object_weight * _object_score(query_vec, labels, text_embedder)
 
     merged = [replace(frame_lookup[fid], score=fused_scores[fid], modality="fused")
               for fid in fused_scores]
@@ -235,7 +374,9 @@ class Reranker:
     tiếng Anh (auto-caption BLIP-style) -- cross-encoder gốc không đáng tin
     cậy cho cặp (query Việt, doc Anh) vì chưa từng thấy dữ liệu liên ngôn
     ngữ lúc train, có thể làm rerank ngẫu nhiên/nhiễu ở bước cuối cùng
-    quyết định thứ tự kết quả.
+    quyết định thứ tự kết quả. Có thể truyền translator để chấm điểm bằng
+    query đã dịch sang tiếng Anh thay vì trông chờ khả năng cross-lingual
+    của cross-encoder.
     """
 
     def __init__(self, sqlite_manager, cross_encoder=None,
@@ -261,17 +402,28 @@ class Reranker:
                 unique.append(c)
         return unique
 
-    def rerank(self, query: str, candidates: list, top_n: int = 10) -> list:
+    def rerank(self, query: str, candidates: list, top_n: int = 10, translator=None) -> list:
         """Rerank candidates đã fusion theo mức độ liên quan thật sự với query.
         Bỏ qua candidate không có text nào (document rỗng, cross-encoder
-        không chấm được). Dùng cho cả KIS và Q&A/VQA."""
+        không chấm được). Dùng cho cả KIS và Q&A/VQA.
+
+        Nếu truyền translator, chấm điểm bằng bản dịch tiếng Anh của query
+        (document_text chủ yếu là caption tiếng Anh) -- lỗi dịch fallback
+        im lặng về query gốc, không phá luồng rerank."""
         unique = self._dedupe(candidates)
         docs = [self._build_document(c) for c in unique]
         valid = [(c, d) for c, d in zip(unique, docs) if d]
         if not valid:
             return []
 
-        pairs = [(query, d) for _, d in valid]
+        rerank_query = query
+        if translator is not None:
+            try:
+                rerank_query = translator.translate(query)
+            except Exception:
+                rerank_query = query
+
+        pairs = [(rerank_query, d) for _, d in valid]
         scores = [float(s) for s in self.cross_encoder.predict(pairs)]
 
         results = [RerankedResult(
@@ -280,10 +432,12 @@ class Reranker:
         results.sort(key=lambda r: r.rerank_score, reverse=True)
         return results[:top_n]
 
-    def rerank_events(self, events: list[str], per_event_candidates: list, top_n: int = 5) -> list:
+    def rerank_events(self, events: list[str], per_event_candidates: list, top_n: int = 5,
+                       translator=None) -> list:
         """Dùng cho TRAKE -- rerank riêng từng event, giữ nguyên thứ tự event
         truyền vào (không gộp candidate giữa các event với nhau)."""
-        return [self.rerank(e, cands, top_n=top_n) for e, cands in zip(events, per_event_candidates)]
+        return [self.rerank(e, cands, top_n=top_n, translator=translator)
+                for e, cands in zip(events, per_event_candidates)]
 
 
 class GroqClient:
@@ -378,13 +532,14 @@ class RagPipeline:
         top_n = top_n if top_n is not None else self.top_n_rerank
         started = time.perf_counter()
         cands = self.retriever.search(query, top_k=self.top_k_retrieve)
-        fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager)
+        fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager,
+                      text_embedder=self.retriever.text_embedder)
         if self.fast_kis:
             results = [self._public_candidate(c) for c in fused[:top_n]]
         else:
             results = [self._public_result(r)
                        for r in self.reranker.rerank(
-                           query, fused, top_n=top_n
+                           query, fused, top_n=top_n, translator=self.retriever.translator
                        )]
         if os.environ.get("RAG_PROFILE", "0") == "1":
             print(
@@ -400,8 +555,9 @@ class RagPipeline:
         if self.llm_client is None:
             raise ValueError("run_qa() cần llm_client (GroqClient) -- KIS thì không cần.")
         cands = self.retriever.search(query, top_k=self.top_k_retrieve)
-        fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager)
-        reranked = self.reranker.rerank(query, fused, top_n=top_n)
+        fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager,
+                      text_embedder=self.retriever.text_embedder)
+        reranked = self.reranker.rerank(query, fused, top_n=top_n, translator=self.retriever.translator)
         return {"answer": build_qa_answer(query, reranked, self.llm_client),
                 "sources": [self._public_result(r) for r in reranked]}
 
@@ -455,9 +611,11 @@ class RagPipeline:
         top_n = top_n if top_n is not None else self.top_n_rerank
         pool_n = min(max(top_n * self._ALIGN_POOL_MULTIPLIER, top_n), self._MAX_ALIGN_POOL)
         cands_per_event = self.retriever.search_events(events, top_k=self.top_k_retrieve)
-        fused_per_event = [merge(c, query=e, sqlite_manager=self.retriever.sqlite_manager)
+        fused_per_event = [merge(c, query=e, sqlite_manager=self.retriever.sqlite_manager,
+                                  text_embedder=self.retriever.text_embedder)
                             for c, e in zip(cands_per_event, events)]
-        reranked = self.reranker.rerank_events(events, fused_per_event, top_n=pool_n)
+        reranked = self.reranker.rerank_events(events, fused_per_event, top_n=pool_n,
+                                                translator=self.retriever.translator)
         aligned = self._align_trake_events(reranked)
         truncated = [ev[:top_n] for ev in aligned]
         return [[self._public_result(r) for r in ev] for ev in truncated]

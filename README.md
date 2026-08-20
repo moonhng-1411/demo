@@ -10,8 +10,8 @@ Hệ thống tìm kiếm video cho bài toán AIC, gồm backend FastAPI, FAISS 
 flowchart LR
     UI[Streamlit frontend\nport 8501]
     API[FastAPI backend\nport 8000]
-    TEXT[faiss_text.index\nBGE-small]
-    CLIP[faiss_clip.index\nOpenCLIP ViT-B/32]
+    TEXT[faiss_text.index\nparaphrase-multilingual-MiniLM-L12-v2]
+    CLIP[faiss_clip.index\nclip-ViT-B-32-multilingual-v1]
     DB[(SQLite\naic.sqlite)]
     MINIO[(MinIO\naic-frames)]
     ASR[text_embedding_metadata.jsonl]
@@ -25,7 +25,7 @@ flowchart LR
     API -->|presigned URL| MINIO
 ```
 
-Luồng KIS gồm các bước encode query bằng BGE và OpenCLIP, tìm kiếm trên hai FAISS index, hợp nhất candidate bằng RRF/object score, sau đó có thể rerank bằng CrossEncoder. Chế độ nhanh có thể bỏ CrossEncoder để giảm độ trễ.
+Luồng KIS gồm các bước encode query bằng paraphrase-multilingual-MiniLM-L12-v2 (text) và clip-ViT-B-32-multilingual-v1 (CLIP), tìm kiếm trên hai FAISS index, hợp nhất candidate bằng RRF/object score, sau đó có thể rerank bằng CrossEncoder. Chế độ nhanh có thể bỏ CrossEncoder để giảm độ trễ.
 
 ## 2. Cấu trúc thư mục
 
@@ -66,7 +66,7 @@ Luồng KIS gồm các bước encode query bằng BGE và OpenCLIP, tìm kiếm
 
 Cần có Python, Git và một MinIO server đang chạy. CUDA không bắt buộc; khi chạy CPU, truy vấn có thể chậm hơn đáng kể so với GPU.
 
-Các package chính gồm FastAPI, Uvicorn, Streamlit, Sentence Transformers, FAISS CPU, PyTorch, OpenCLIP, Faster Whisper, Groq và MinIO SDK.
+Các package chính gồm FastAPI, Uvicorn, Streamlit, Sentence Transformers (dùng cho cả text embedding và CLIP embedding), FAISS CPU, PyTorch, Faster Whisper, Groq và MinIO SDK.
 
 ## 4. Cài đặt trên Windows
 
@@ -87,7 +87,7 @@ Nếu PowerShell chặn activate script, có thể chạy trực tiếp executab
 python.exe -m pip install -r requirements.txt
 ```
 
-Sau khi cài package lần đầu, các model Hugging Face/OpenCLIP có thể được tải về cache. Vì vậy lần khởi động backend đầu tiên có thể lâu hơn các lần sau.
+Sau khi cài package lần đầu, các model Hugging Face/Sentence Transformers có thể được tải về cache. Vì vậy lần khởi động backend đầu tiên có thể lâu hơn các lần sau.
 
 ## 5. Chuẩn bị dữ liệu
 
