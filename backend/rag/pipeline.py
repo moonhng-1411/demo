@@ -233,6 +233,12 @@ class Retriever:
         parts = [p.strip() for p in self._SPLIT_RE.split(query) if p and p.strip()]
         return [p for p in parts if len(_tokenize(p)) >= 2]
 
+    # Hằng số RRF dùng để chấm điểm rank-based CỤC BỘ trong 1 fragment (câu
+    # gốc/bản dịch/rewrite/1 clause), tách biệt với RRF_K dùng ở merge() để
+    # gộp nhiều modality lại với nhau -- 2 tầng RRF độc lập, xem docstring
+    # search().
+    _FRAGMENT_RRF_K = 60
+
     def search(self, query: str, top_k: int = 50, translate: bool = True) -> dict:
         """Truy vấn cả hai index text và CLIP.
 
@@ -246,31 +252,76 @@ class Retriever:
           của server.
         - với câu dài (>_LONG_QUERY_TOKEN_THRESHOLD token), search thêm
           bằng 1 cụm từ khoá tiếng Anh do LLM rút gọn, nhấn vào chi tiết
-          hiếm/đặc trưng (nếu có rewriter) -- xem QueryRewriter. Chống lại
-          hiện tượng "chi tiết hiếm bị pha loãng trong câu dài" khiến kết
-          quả trả về đúng chủ đề chung nhưng sai cảnh cụ thể.
+          hiếm/đặc trưng (nếu có rewriter) -- xem QueryRewriter.
         - với câu dài, cũng search thêm theo từng clause tách nhỏ (xem
-          _split_clauses), bổ trợ cho rewrite ở góc độ khác (giữ nguyên văn
-          từng cụm thay vì để LLM diễn giải lại).
-        Các lượt search phụ này được cộng thêm vào cùng results[modality],
-        nhân với hệ số <1 để câu gốc/bản dịch đầy đủ vẫn có ưu tiên cao hơn.
-        merge() ở dưới sẽ dedupe theo frame_id trước khi tính RRF, nên
-        trùng lặp giữa các lượt search không làm hỏng thứ hạng.
+          _split_clauses).
+        Mỗi lượt search phụ này gọi là 1 "fragment" của query gốc.
+
+        THIẾT KẾ ĐIỂM SỐ -- vì sao dùng rank-based (RRF) thay vì cosine
+        similarity thô:
+        Cách cũ cộng thẳng cosine similarity (nhân hệ số <1 theo fragment)
+        của MỌI fragment vào chung 1 pool rồi để merge() sort theo giá trị
+        đó. Nhưng cosine similarity của các fragment khác nhau (câu dài
+        đầy đủ vs. 1 clause ngắn/hẹp) không cùng thang đo: 1 frame chỉ
+        khớp with đúng 1 clause hẹp (vd chỉ "tạo hình trái tim bằng tay")
+        có thể đạt similarity rất cao cho riêng clause đó, đủ để similarity
+        đã nhân hệ số vẫn cao hơn hẳn 1 frame khớp *toàn bộ* câu nhưng chỉ
+        vừa phải -- dẫn tới "chỉ khớp 1 đoạn trong query vẫn lọt top",
+        đúng vấn đề observe được trong thực tế.
+
+        Để chống lại, mỗi fragment chỉ đóng góp điểm RANK-BASED (kiểu RRF:
+        1/(k+rank), rank tính RIÊNG trong phạm vi kết quả của fragment đó,
+        theo từng modality) thay vì cosine similarity thô. Điểm rank-based
+        luôn bị CHẶN TRẦN ở khoảng 1/(k+1) bất kể similarity gốc cao đến
+        đâu, nên 1 match "ăn may" cực mạnh ở 1 fragment hẹp không thể áp
+        đảo được nữa. Đồng thời, đóng góp từ NHIỀU fragment khác nhau được
+        CỘNG DỒN cho cùng 1 frame_id (nhân trọng số fragment: 1.0 câu gốc,
+        0.9 dịch/rewrite, 0.7 mỗi clause) -- nên 1 frame được nhiều fragment
+        (= nhiều phần khác nhau của query) cùng "đồng thuận" sẽ có tổng
+        điểm cao hơn hẳn 1 frame chỉ được đúng 1 fragment công nhận, đúng ý
+        "phải khớp cả query" thay vì chỉ 1 đoạn.
         """
-        results = {"caption": [], "asr": [], "visual": []}
+        # modality -> frame_id -> điểm rank-based đã cộng dồn qua các fragment
+        accum: dict[str, dict[int, float]] = {"caption": {}, "asr": {}, "visual": {}}
+        # frame_id -> Candidate mẫu (giữ metadata video_id/frame_idx/timestamp
+        # từ lần đầu gặp -- KHÔNG dùng field .score của candidate này, điểm
+        # thật lấy từ accum ở cuối hàm).
+        frame_lookup: dict[int, Candidate] = {}
         profile = os.environ.get("RAG_PROFILE", "0") == "1"
         started = time.perf_counter()
 
+        def _accumulate_text(raw_hits, weight: float) -> None:
+            """raw_hits: list[(entry, modality, score)] từ faiss_manager.search_text.
+            Nhóm theo modality trước khi tính rank -- 1 lượt search_text có
+            thể trả về hit của nhiều modality (caption/asr) xen kẽ nhau,
+            tính rank lẫn lộn sẽ sai lệch thứ hạng thật trong từng modality.
+            """
+            by_modality: dict[str, list[tuple[int, Candidate]]] = {}
+            for entry, modality, score in raw_hits:
+                c = self._text_candidate(entry, modality, score)
+                by_modality.setdefault(modality, []).append((c.frame_id, c))
+            for modality, hits in by_modality.items():
+                rrf = _rrf_scores([fid for fid, _ in hits], k=self._FRAGMENT_RRF_K)
+                for fid, c in hits:
+                    frame_lookup.setdefault(fid, c)
+                    accum[modality][fid] = accum[modality].get(fid, 0.0) + weight * rrf[fid]
+
+        def _accumulate_clip(raw_hits, weight: float) -> None:
+            """raw_hits: list[(frame_id, score)] từ faiss_manager.search_clip."""
+            hits = [(fid, self._visual_candidate(fid, score)) for fid, score in raw_hits]
+            rrf = _rrf_scores([fid for fid, _ in hits], k=self._FRAGMENT_RRF_K)
+            for fid, c in hits:
+                frame_lookup.setdefault(fid, c)
+                accum["visual"][fid] = accum["visual"].get(fid, 0.0) + weight * rrf[fid]
+
         text_vec = self.text_embedder.encode(query)
         text_encoded = time.perf_counter()
-        for entry, modality, score in self.faiss_manager.search_text(text_vec, top_k=top_k):
-            results[modality].append(self._text_candidate(entry, modality, score))
+        _accumulate_text(list(self.faiss_manager.search_text(text_vec, top_k=top_k)), weight=1.0)
         text_searched = time.perf_counter()
 
         clip_vec = self.clip_embedder.encode(query)
         clip_encoded = time.perf_counter()
-        for frame_id, score in self.faiss_manager.search_clip(clip_vec, top_k=top_k):
-            results["visual"].append(self._visual_candidate(frame_id, score))
+        _accumulate_clip(list(self.faiss_manager.search_clip(clip_vec, top_k=top_k)), weight=1.0)
         finished = time.perf_counter()
 
         translated = None
@@ -284,11 +335,9 @@ class Retriever:
 
         if translated:
             en_text_vec = self.text_embedder.encode(translated)
-            for entry, modality, score in self.faiss_manager.search_text(en_text_vec, top_k=top_k):
-                results[modality].append(self._text_candidate(entry, modality, score * 0.9))
+            _accumulate_text(list(self.faiss_manager.search_text(en_text_vec, top_k=top_k)), weight=0.9)
             en_clip_vec = self.clip_embedder.encode(translated)
-            for frame_id, score in self.faiss_manager.search_clip(en_clip_vec, top_k=top_k):
-                results["visual"].append(self._visual_candidate(frame_id, score * 0.9))
+            _accumulate_clip(list(self.faiss_manager.search_clip(en_clip_vec, top_k=top_k)), weight=0.9)
         translate_done = time.perf_counter()
 
         is_long_query = len(_tokenize(query)) > self._LONG_QUERY_TOKEN_THRESHOLD
@@ -311,22 +360,30 @@ class Retriever:
 
         if rewritten:
             kw_text_vec = self.text_embedder.encode(rewritten)
-            for entry, modality, score in self.faiss_manager.search_text(kw_text_vec, top_k=top_k):
-                results[modality].append(self._text_candidate(entry, modality, score * 0.9))
+            _accumulate_text(list(self.faiss_manager.search_text(kw_text_vec, top_k=top_k)), weight=0.9)
             kw_clip_vec = self.clip_embedder.encode(rewritten)
-            for frame_id, score in self.faiss_manager.search_clip(kw_clip_vec, top_k=top_k):
-                results["visual"].append(self._visual_candidate(frame_id, score * 0.9))
+            _accumulate_clip(list(self.faiss_manager.search_clip(kw_clip_vec, top_k=top_k)), weight=0.9)
         rewrite_done = time.perf_counter()
 
+        num_clauses = 0
         if is_long_query:
             for clause in self._split_clauses(query):
+                num_clauses += 1
                 clause_text_vec = self.text_embedder.encode(clause)
-                for entry, modality, score in self.faiss_manager.search_text(clause_text_vec, top_k=top_k // 2):
-                    results[modality].append(self._text_candidate(entry, modality, score * 0.7))
+                _accumulate_text(
+                    list(self.faiss_manager.search_text(clause_text_vec, top_k=top_k // 2)), weight=0.7
+                )
                 clause_clip_vec = self.clip_embedder.encode(clause)
-                for frame_id, score in self.faiss_manager.search_clip(clause_clip_vec, top_k=top_k // 2):
-                    results["visual"].append(self._visual_candidate(frame_id, score * 0.7))
+                _accumulate_clip(
+                    list(self.faiss_manager.search_clip(clause_clip_vec, top_k=top_k // 2)), weight=0.7
+                )
         clause_searched = time.perf_counter()
+
+        results = {
+            modality: [replace(frame_lookup[fid], score=score, modality=modality)
+                       for fid, score in frame_scores.items()]
+            for modality, frame_scores in accum.items()
+        }
 
         if profile:
             print(
@@ -338,6 +395,7 @@ class Retriever:
                 f"translate_search={translate_done-finished:.2f}s "
                 f"rewrite_search={rewrite_done-translate_done:.2f}s "
                 f"clause_search={clause_searched-rewrite_done:.2f}s "
+                f"num_clauses={num_clauses} "
                 f"total_retrieve={clause_searched-started:.2f}s"
             )
         return results
