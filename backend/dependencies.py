@@ -8,7 +8,7 @@ from minio import Minio
 
 from database.sqlite_manager import SqliteManager
 from database.faiss_manager import FaissManager
-from rag.pipeline import Retriever, Reranker, RagPipeline, GroqClient, QueryTranslator
+from rag.pipeline import Retriever, Reranker, RagPipeline, GroqClient, QueryTranslator, QueryRewriter
 
 DB_PATH = os.environ.get("AIC_DB_PATH", "data/aic.sqlite")
 INDEX_ROOT = os.environ.get("AIC_INDEX_ROOT", "data/index")
@@ -40,7 +40,18 @@ if TRANSLATE_QUERY and query_translator is None:
     print("[WARN] RAG_TRANSLATE_QUERY=1 nhưng thiếu GROQ_API_KEY -- bỏ qua dịch query, "
           "chạy như cũ (chỉ multilingual embedder/cross-encoder).")
 
-retriever = Retriever(faiss_manager, sqlite_manager, translator=query_translator)
+# Rút gọn query dài thành cụm từ khoá tiếng Anh nhấn vào chi tiết hiếm/đặc
+# trưng, chống pha loãng ngữ nghĩa khi encode cả câu dài thành 1 vector
+# (xem docstring QueryRewriter). Dùng chung cờ RAG_TRANSLATE_QUERY +
+# GROQ_API_KEY với query_translator vì đều là bước tăng cường bằng LLM qua
+# Groq -- tắt dịch nghĩa là tắt cả rewrite, đúng như UI "Dịch/Không dịch"
+# thể hiện (bật = cho phép LLM hỗ trợ query, tắt = search thuần vector).
+# Retriever xử lý rewriter=None an toàn (bỏ qua bước rewrite).
+query_rewriter = (
+    QueryRewriter() if TRANSLATE_QUERY and os.environ.get("GROQ_API_KEY") else None
+)
+
+retriever = Retriever(faiss_manager, sqlite_manager, translator=query_translator, rewriter=query_rewriter)
 reranker = Reranker(sqlite_manager)
 llm_client = GroqClient() if os.environ.get("GROQ_API_KEY") else None
 # 20 mỗi modality thường đủ cho KIS và giảm đáng kể số cặp đưa vào CrossEncoder.

@@ -4,14 +4,23 @@ import streamlit as st
 from api import AicApiClient
 
 
-def render_sidebar() -> tuple[str, int, int]:
+def render_sidebar() -> tuple[str, int, int, bool]:
     """Sidebar chọn loại truy vấn + tham số hiển thị."""
     with st.sidebar:
         st.header("Tuỳ chọn")
         mode = st.radio("Loại truy vấn", ["KIS", "Q&A", "TRAKE"])
         top_n = st.slider("Số kết quả", 1, 20, 10)
         n_cols = st.slider("Số cột hiển thị", 2, 6, 5)
-    return mode, top_n, n_cols
+        translate = st.toggle(
+            "🌐 Dịch query sang tiếng Anh",
+            value=True,
+            help=(
+                "Bật: query được dịch VI->EN trước khi tìm kiếm, thường khớp tốt hơn "
+                "với caption/nhãn vật thể (chủ yếu tiếng Anh). "
+                "Tắt: tìm kiếm bằng đúng câu gốc, không gọi bước dịch."
+            ),
+        )
+    return mode, top_n, n_cols, translate
 
 
 def render_results(results: list[dict], api: AicApiClient, n_cols: int = 4):

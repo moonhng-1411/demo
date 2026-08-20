@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 def kis(req: KISRequest, pipeline: RagPipeline = Depends(get_pipeline)):
     """Known-Item Search -- trả về list frame/timestamp, không gọi LLM."""
     try:
-        return {"results": pipeline.run_kis(req.query, top_n=req.top_n)}
+        return {"results": pipeline.run_kis(req.query, top_n=req.top_n, translate=req.translate)}
     except Exception:
         logger.exception("Lỗi khi xử lý /api/kis")
         raise HTTPException(status_code=500, detail="Lỗi nội bộ khi xử lý KIS")
@@ -28,7 +28,7 @@ def qa(req: QARequest, pipeline: RagPipeline = Depends(get_pipeline)):
     if pipeline.llm_client is None:
         raise HTTPException(status_code=400, detail="GROQ_API_KEY chưa được set trên server")
     try:
-        return pipeline.run_qa(req.query, top_n=req.top_n)
+        return pipeline.run_qa(req.query, top_n=req.top_n, translate=req.translate)
     except Exception:
         logger.exception("Lỗi khi xử lý /api/qa")
         raise HTTPException(status_code=500, detail="Lỗi nội bộ khi xử lý Q&A")
@@ -38,7 +38,7 @@ def qa(req: QARequest, pipeline: RagPipeline = Depends(get_pipeline)):
 def trake(req: TRAKERequest, pipeline: RagPipeline = Depends(get_pipeline)):
     """TRAKE -- trả về list kết quả cho từng event, theo đúng thứ tự events truyền vào."""
     try:
-        return {"results": pipeline.run_trake(req.events, top_n=req.top_n)}
+        return {"results": pipeline.run_trake(req.events, top_n=req.top_n, translate=req.translate)}
     except Exception:
         logger.exception("Lỗi khi xử lý /api/trake")
         raise HTTPException(status_code=500, detail="Lỗi nội bộ khi xử lý TRAKE")

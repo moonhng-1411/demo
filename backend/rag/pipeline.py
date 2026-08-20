@@ -102,20 +102,89 @@ class QueryTranslator:
         return translated
 
 
+class QueryRewriter:
+    """Rút gọn query dài, nhiều chi tiết thành 1 cụm từ khoá tiếng Anh súc
+    tích, NHẤN VÀO các chi tiết đặc trưng/hiếm (trang phục, cử chỉ, vật thể
+    bất thường...) thay vì các từ phổ biến (người, phòng, hành lang...).
+
+    Lý do tồn tại riêng biệt với QueryTranslator: dịch nguyên câu dài vẫn
+    encode cả câu thành 1 vector duy nhất, nên các chi tiết hiếm/phân biệt
+    được vẫn bị pha loãng bởi các từ ngữ cảnh chung chung xuất hiện trong
+    rất nhiều frame khác nhau (vd "phụ nữ", "hành lang bệnh viện", "em bé").
+    Kết quả quan sát được: trả về frame "liên quan" (đúng chủ đề chung)
+    nhưng sai cảnh cụ thể. Cụm từ khoá cô đọng, thiên về chi tiết hiếm giúp
+    vector embedding của lượt search bổ sung này bám sát đúng frame đích
+    hơn, được cộng thêm vào fusion cùng lượt search câu gốc/bản dịch đầy đủ
+    (xem Retriever.search) chứ không thay thế chúng.
+
+    Lỗi rewrite (Groq timeout/rate-limit) không được làm hỏng pipeline --
+    xử lý fallback (bỏ qua lượt search này) ở nơi gọi, giống QueryTranslator.
+    """
+    SYSTEM_PROMPT = (
+        "You help a visual video-frame search engine. Given a Vietnamese "
+        "search query describing a scene, output a SHORT English keyword "
+        "phrase (under 12 words) for retrieval. Prioritize and keep the "
+        "rare, distinctive visual details (costumes, gestures, unusual "
+        "objects, specific actions) that would distinguish this exact "
+        "scene from similar generic scenes. Drop or shorten generic "
+        "context words (e.g. 'a woman', 'a hallway') if space is limited "
+        "-- they add little discriminative value on their own. Output "
+        "ONLY the keyword phrase -- no quotes, no explanation."
+    )
+
+    def __init__(self, api_key=None, model=None):
+        from groq import Groq
+        self.client = Groq(api_key=api_key or os.environ.get("GROQ_API_KEY"))
+        self.model = model or GroqClient.DEFAULT_MODEL
+        self._cache: dict[str, str] = {}
+
+    def rewrite(self, text: str) -> str:
+        if text in self._cache:
+            return self._cache[text]
+        r = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "system", "content": self.SYSTEM_PROMPT},
+                      {"role": "user", "content": text}],
+            temperature=0.0, max_tokens=64,
+        )
+        rewritten = r.choices[0].message.content.strip()
+        self._cache[text] = rewritten
+        return rewritten
+
+
 class Retriever:
     """Gộp kết quả từ 2 FAISS index (text: caption+asr, clip: ảnh) thành
     1 dict {modality: [Candidate]} để đưa vào fusion."""
 
-    _SPLIT_RE = re.compile(r"[,;]|(?:\bvà\b)|(?:\bvới\b)|(?:\btrong khi\b)", re.IGNORECASE)
+    # Tách theo dấu câu/liên từ liệt kê (cũ) VÀ theo các từ nối chỉ trình tự
+    # thời gian ("đầu tiên", "sau đó", "tiếp theo", "cuối cùng"...) cùng dấu
+    # chấm câu -- cần thiết cho các query KIS/TRAKE-trong-1-câu kiểu "Đầu
+    # tiên là cảnh A. Sau đó là cảnh B.", vốn mô tả nhiều cảnh RẤT khác nhau
+    # nhưng trước đây bị encode chung thành 1 vector (semantic dilution nặng
+    # vì các cảnh không liên quan ngữ nghĩa, khác hẳn liệt kê "và"/"với" các
+    # chi tiết CÙNG một cảnh). "là" ngay sau từ nối được match luôn để không
+    # để sót ở đầu clause kế tiếp.
+    _SPLIT_RE = re.compile(
+        r"[,;.]"
+        r"|(?:\bvà\b)|(?:\bvới\b)|(?:\btrong khi\b)"
+        r"|(?:\bđầu tiên\b(?:\s+là\b)?)"
+        r"|(?:\bsau đó\b(?:\s+là\b)?)"
+        r"|(?:\btiếp theo\b(?:\s+là\b)?)"
+        r"|(?:\bkế tiếp\b(?:\s+là\b)?)"
+        r"|(?:\bcuối cùng\b(?:\s+là\b)?)"
+        r"|(?:\brồi\b(?:\s+sau đó\b)?)",
+        re.IGNORECASE,
+    )
     _LONG_QUERY_TOKEN_THRESHOLD = 12
 
     def __init__(self, faiss_manager, sqlite_manager, text_embedder=None,
-                 clip_embedder=None, translator=None):
+                 clip_embedder=None, translator=None, rewriter=None):
         self.faiss_manager = faiss_manager
         self.sqlite_manager = sqlite_manager
         self.text_embedder = text_embedder or TextEmbedder()
         self.clip_embedder = clip_embedder or ClipQueryEmbedder()
         self.translator = translator  # None hợp lệ -- bỏ qua bước dịch nếu không truyền vào
+        self.rewriter = rewriter  # None hợp lệ -- bỏ qua bước rút gọn từ khoá nếu không truyền vào
 
     def _text_candidate(self, entry: dict, modality: str, score: float) -> Candidate:
         """Chuyển một hit text thành Candidate.
@@ -164,16 +233,25 @@ class Retriever:
         parts = [p.strip() for p in self._SPLIT_RE.split(query) if p and p.strip()]
         return [p for p in parts if len(_tokenize(p)) >= 2]
 
-    def search(self, query: str, top_k: int = 50) -> dict:
+    def search(self, query: str, top_k: int = 50, translate: bool = True) -> dict:
         """Truy vấn cả hai index text và CLIP.
 
         Ngoài search bằng câu gốc, còn:
-        - search thêm bằng bản dịch tiếng Anh (nếu có translator) -- vì
-          caption/object label trong hệ thống chủ yếu tiếng Anh, khớp trực
-          tiếp đáng tin hơn là dựa vào khả năng cross-lingual của multilingual
-          embedder.
-        - với câu dài (>_LONG_QUERY_TOKEN_THRESHOLD token), search thêm theo
-          từng clause tách nhỏ (xem _split_clauses).
+        - search thêm bằng bản dịch tiếng Anh (nếu có translator VÀ
+          ``translate=True``) -- vì caption/object label trong hệ thống chủ
+          yếu tiếng Anh, khớp trực tiếp đáng tin hơn là dựa vào khả năng
+          cross-lingual của multilingual embedder. ``translate=False`` cho
+          phép người dùng tắt bước dịch/rewrite theo từng request (vd. UI
+          có nút "Dịch/Không dịch"), độc lập với cấu hình RAG_TRANSLATE_QUERY
+          của server.
+        - với câu dài (>_LONG_QUERY_TOKEN_THRESHOLD token), search thêm
+          bằng 1 cụm từ khoá tiếng Anh do LLM rút gọn, nhấn vào chi tiết
+          hiếm/đặc trưng (nếu có rewriter) -- xem QueryRewriter. Chống lại
+          hiện tượng "chi tiết hiếm bị pha loãng trong câu dài" khiến kết
+          quả trả về đúng chủ đề chung nhưng sai cảnh cụ thể.
+        - với câu dài, cũng search thêm theo từng clause tách nhỏ (xem
+          _split_clauses), bổ trợ cho rewrite ở góc độ khác (giữ nguyên văn
+          từng cụm thay vì để LLM diễn giải lại).
         Các lượt search phụ này được cộng thêm vào cùng results[modality],
         nhân với hệ số <1 để câu gốc/bản dịch đầy đủ vẫn có ưu tiên cao hơn.
         merge() ở dưới sẽ dedupe theo frame_id trước khi tính RRF, nên
@@ -196,7 +274,7 @@ class Retriever:
         finished = time.perf_counter()
 
         translated = None
-        if self.translator is not None:
+        if self.translator is not None and translate:
             try:
                 translated = self.translator.translate(query)
             except Exception as e:
@@ -213,7 +291,34 @@ class Retriever:
                 results["visual"].append(self._visual_candidate(frame_id, score * 0.9))
         translate_done = time.perf_counter()
 
-        if len(_tokenize(query)) > self._LONG_QUERY_TOKEN_THRESHOLD:
+        is_long_query = len(_tokenize(query)) > self._LONG_QUERY_TOKEN_THRESHOLD
+
+        # Câu dài, nhiều chi tiết dễ bị "loãng nghĩa" khi encode chung 1
+        # vector -- các chi tiết đặc trưng/hiếm (trang phục, cử chỉ...) mất
+        # ưu thế trước các từ ngữ cảnh chung chung (người, phòng...) xuất
+        # hiện trong rất nhiều frame. Rewrite thành từ khoá cô đọng, thiên
+        # về chi tiết hiếm giúp lượt search bổ sung này bám đúng frame đích
+        # hơn. Chỉ chạy cho câu dài để không tốn thêm 1 lời gọi LLM cho
+        # query ngắn vốn đã đủ cụ thể.
+        rewritten = None
+        if self.rewriter is not None and translate and is_long_query:
+            try:
+                rewritten = self.rewriter.rewrite(query)
+            except Exception as e:
+                rewritten = None
+                if profile:
+                    print(f"[RAG_PROFILE] rewrite lỗi, bỏ qua: {e}")
+
+        if rewritten:
+            kw_text_vec = self.text_embedder.encode(rewritten)
+            for entry, modality, score in self.faiss_manager.search_text(kw_text_vec, top_k=top_k):
+                results[modality].append(self._text_candidate(entry, modality, score * 0.9))
+            kw_clip_vec = self.clip_embedder.encode(rewritten)
+            for frame_id, score in self.faiss_manager.search_clip(kw_clip_vec, top_k=top_k):
+                results["visual"].append(self._visual_candidate(frame_id, score * 0.9))
+        rewrite_done = time.perf_counter()
+
+        if is_long_query:
             for clause in self._split_clauses(query):
                 clause_text_vec = self.text_embedder.encode(clause)
                 for entry, modality, score in self.faiss_manager.search_text(clause_text_vec, top_k=top_k // 2):
@@ -231,15 +336,16 @@ class Retriever:
                 f"clip_encode={clip_encoded-text_searched:.2f}s "
                 f"clip_search_map={finished-clip_encoded:.2f}s "
                 f"translate_search={translate_done-finished:.2f}s "
-                f"clause_search={clause_searched-translate_done:.2f}s "
+                f"rewrite_search={rewrite_done-translate_done:.2f}s "
+                f"clause_search={clause_searched-rewrite_done:.2f}s "
                 f"total_retrieve={clause_searched-started:.2f}s"
             )
         return results
 
-    def search_events(self, events: list[str], top_k: int = 50) -> list[dict]:
+    def search_events(self, events: list[str], top_k: int = 50, translate: bool = True) -> list[dict]:
         """Dùng cho TRAKE -- search riêng từng event, giữ đúng thứ tự events
         truyền vào (không được sắp xếp lại)."""
-        return [self.search(e, top_k=top_k) for e in events]
+        return [self.search(e, top_k=top_k, translate=translate) for e in events]
 
 
 DEFAULT_MODALITY_WEIGHTS = {"caption": 1.0, "asr": 0.8, "visual": 1.0}
@@ -527,11 +633,15 @@ class RagPipeline:
         self.top_n_rerank = top_n_rerank
         self.fast_kis = fast_kis
 
-    def run_kis(self, query: str, top_n: int | None = None) -> list[dict]:
-        """KIS; có thể bỏ CrossEncoder bằng ``RAG_FAST_KIS=1``."""
+    def run_kis(self, query: str, top_n: int | None = None, translate: bool = True) -> list[dict]:
+        """KIS; có thể bỏ CrossEncoder bằng ``RAG_FAST_KIS=1``.
+
+        ``translate=False`` tắt bước dịch VI->EN cho riêng request này (bỏ
+        qua cả ở retrieve lẫn rerank), độc lập với cấu hình server."""
         top_n = top_n if top_n is not None else self.top_n_rerank
+        translator = self.retriever.translator if translate else None
         started = time.perf_counter()
-        cands = self.retriever.search(query, top_k=self.top_k_retrieve)
+        cands = self.retriever.search(query, top_k=self.top_k_retrieve, translate=translate)
         fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager,
                       text_embedder=self.retriever.text_embedder)
         if self.fast_kis:
@@ -539,7 +649,7 @@ class RagPipeline:
         else:
             results = [self._public_result(r)
                        for r in self.reranker.rerank(
-                           query, fused, top_n=top_n, translator=self.retriever.translator
+                           query, fused, top_n=top_n, translator=translator
                        )]
         if os.environ.get("RAG_PROFILE", "0") == "1":
             print(
@@ -548,16 +658,17 @@ class RagPipeline:
             )
         return results
 
-    def run_qa(self, query: str, top_n: int | None = None) -> dict:
+    def run_qa(self, query: str, top_n: int | None = None, translate: bool = True) -> dict:
         """Q&A/VQA -- đi tiếp bước gọi LLM sinh câu trả lời tự nhiên,
         kèm sources đã rerank để hiển thị bằng chứng."""
         top_n = top_n if top_n is not None else self.top_n_rerank
         if self.llm_client is None:
             raise ValueError("run_qa() cần llm_client (GroqClient) -- KIS thì không cần.")
-        cands = self.retriever.search(query, top_k=self.top_k_retrieve)
+        translator = self.retriever.translator if translate else None
+        cands = self.retriever.search(query, top_k=self.top_k_retrieve, translate=translate)
         fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager,
                       text_embedder=self.retriever.text_embedder)
-        reranked = self.reranker.rerank(query, fused, top_n=top_n, translator=self.retriever.translator)
+        reranked = self.reranker.rerank(query, fused, top_n=top_n, translator=translator)
         return {"answer": build_qa_answer(query, reranked, self.llm_client),
                 "sources": [self._public_result(r) for r in reranked]}
 
@@ -604,18 +715,19 @@ class RagPipeline:
             aligned_results.append(aligned + rest)
         return aligned_results
 
-    def run_trake(self, events: list[str], top_n: int | None = None) -> list[list[dict]]:
+    def run_trake(self, events: list[str], top_n: int | None = None, translate: bool = True) -> list[list[dict]]:
         """TRAKE (multi-event/temporal) -- search+rerank riêng từng event, sau đó
         align timestamp giữa các event trong cùng video để ưu tiên đúng chuỗi
         sự kiện theo thứ tự thời gian."""
         top_n = top_n if top_n is not None else self.top_n_rerank
         pool_n = min(max(top_n * self._ALIGN_POOL_MULTIPLIER, top_n), self._MAX_ALIGN_POOL)
-        cands_per_event = self.retriever.search_events(events, top_k=self.top_k_retrieve)
+        translator = self.retriever.translator if translate else None
+        cands_per_event = self.retriever.search_events(events, top_k=self.top_k_retrieve, translate=translate)
         fused_per_event = [merge(c, query=e, sqlite_manager=self.retriever.sqlite_manager,
                                   text_embedder=self.retriever.text_embedder)
                             for c, e in zip(cands_per_event, events)]
         reranked = self.reranker.rerank_events(events, fused_per_event, top_n=pool_n,
-                                                translator=self.retriever.translator)
+                                                translator=translator)
         aligned = self._align_trake_events(reranked)
         truncated = [ev[:top_n] for ev in aligned]
         return [[self._public_result(r) for r in ev] for ev in truncated]

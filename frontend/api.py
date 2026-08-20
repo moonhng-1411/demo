@@ -34,18 +34,21 @@ class AicApiClient:
         except requests.RequestException:
             return False
 
-    def search_kis(self, query: str, top_n: int = 10) -> list[dict]:
-        """Known-Item Search -- trả về video_id, frame_idx và score."""
-        data = self._post("/api/kis", {"query": query, "top_n": top_n})
+    def search_kis(self, query: str, top_n: int = 10, translate: bool = True) -> list[dict]:
+        """Known-Item Search -- trả về video_id, frame_idx và score.
+
+        ``translate=False`` tắt bước dịch query VI->EN ở backend cho riêng
+        request này (search + rerank bằng đúng câu gốc)."""
+        data = self._post("/api/kis", {"query": query, "top_n": top_n, "translate": translate})
         return data["results"]
 
-    def ask_qa(self, query: str, top_n: int = 10) -> dict:
+    def ask_qa(self, query: str, top_n: int = 10, translate: bool = True) -> dict:
         """Q&A -- trả về {answer: str, sources: list[dict]}."""
-        return self._post("/api/qa", {"query": query, "top_n": top_n})
+        return self._post("/api/qa", {"query": query, "top_n": top_n, "translate": translate})
 
-    def search_trake(self, events: list[str], top_n: int = 5) -> list[list[dict]]:
+    def search_trake(self, events: list[str], top_n: int = 5, translate: bool = True) -> list[list[dict]]:
         """TRAKE -- trả về kết quả cho từng event."""
-        data = self._post("/api/trake", {"events": events, "top_n": top_n})
+        data = self._post("/api/trake", {"events": events, "top_n": top_n, "translate": translate})
         return data["results"]
 
     def keyframe_image_url(self, video_id: str, frame_idx: int) -> str:
