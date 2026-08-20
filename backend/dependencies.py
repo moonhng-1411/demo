@@ -44,10 +44,17 @@ else:
 pipeline = RagPipeline(retriever, reranker, **pipeline_kwargs)
 
 MINIO_SECURE = os.environ.get("MINIO_SECURE", "false").lower() in {"1", "true", "yes", "on"}
+_MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY")
+_MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY")
+if not _MINIO_ACCESS_KEY or not _MINIO_SECRET_KEY:
+    raise RuntimeError(
+        "Thiếu MINIO_ACCESS_KEY / MINIO_SECRET_KEY trong biến môi trường (.env). "
+        "Backend cần MinIO để phục vụ ảnh keyframe, hãy cấu hình trước khi khởi động."
+    )
 minio_public_client = Minio(
     os.environ.get("MINIO_PUBLIC_ENDPOINT", os.environ.get("MINIO_ENDPOINT", "localhost:9000")),
-    access_key=os.environ["MINIO_ACCESS_KEY"],
-    secret_key=os.environ["MINIO_SECRET_KEY"],
+    access_key=_MINIO_ACCESS_KEY,
+    secret_key=_MINIO_SECRET_KEY,
     secure=MINIO_SECURE,
 )
 

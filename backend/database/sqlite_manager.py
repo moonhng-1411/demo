@@ -116,3 +116,14 @@ class SqliteManager:
             "ocr_text": None,
             "asr_text": seg["text"] if seg else None,
         }
+
+    def clear_caches(self) -> None:
+        """Xóa toàn bộ lru_cache (frame_info/frame_objects/frame_texts).
+
+        Cần gọi sau khi aic.sqlite được cập nhật lúc runtime (ví dụ upload
+        thêm keyframe/caption mới) để tránh trả về dữ liệu cũ đã cache từ
+        trước đó -- các cache này không tự hết hạn theo thời gian.
+        """
+        self.get_frame_info.cache_clear()
+        self.get_frame_objects.cache_clear()
+        self.get_frame_texts.cache_clear()

@@ -1,5 +1,6 @@
 import faiss
 import json
+import os
 import numpy as np
 
 
@@ -9,8 +10,7 @@ class FaissManager:
         """clip_id_map_path giờ trỏ tới id_map.json (đã verify đúng, 18/20 hit),
         KHÔNG dùng clip_id_map.npy tự build (đã xác nhận sai)."""
         self.text_index = faiss.read_index(text_index_path)
-        with open(text_metadata_path, "r", encoding="utf-8") as f:
-            self.text_metadata = [json.loads(line) for line in f if line.strip()]
+        self.text_metadata = self._load_text_metadata(text_metadata_path)
         assert self.text_index.ntotal == len(self.text_metadata), \
             "faiss_text.index và metadata lệch số dòng"
 
@@ -18,6 +18,56 @@ class FaissManager:
         self.clip_id_map = self._load_id_map(clip_id_map_path)
         assert self.clip_index.ntotal == len(self.clip_id_map), \
             "faiss_clip.index và clip id map lệch số dòng"
+
+    @staticmethod
+    def _resolve_text_metadata_path(path: str) -> str:
+        """Tự dò file thật nếu path truyền vào không tồn tại nhưng có phiên bản
+        đuôi khác (.json <-> .jsonl) tồn tại -- tránh lệch tên như đã thấy giữa
+        code (mặc định .jsonl) và text_embedding_manifest.json (ghi tên .json)."""
+        if os.path.isfile(path):
+            return path
+        base, ext = os.path.splitext(path)
+        for alt_ext in (".json", ".jsonl"):
+            alt_path = base + alt_ext
+            if os.path.isfile(alt_path):
+                return alt_path
+        return path  # để nguyên -- sẽ raise FileNotFoundError rõ ràng lúc open()
+
+    @staticmethod
+    def _load_text_metadata(path: str) -> list[dict]:
+        """Đọc metadata text embedding, tự nhận diện JSONL (mỗi dòng 1 object)
+        hoặc JSON thường (mảng object, hoặc object chứa mảng ở 1 key con) --
+        không giả định cứng định dạng theo phần mở rộng, vì tên file thật
+        (theo text_embedding_manifest.json) có thể không khớp quy ước .jsonl
+        mà code trước đây giả định."""
+        resolved = FaissManager._resolve_text_metadata_path(path)
+        with open(resolved, "r", encoding="utf-8") as f:
+            raw = f.read()
+
+        stripped = raw.strip()
+        if not stripped:
+            raise ValueError(f"File metadata rỗng: {resolved}")
+
+        # Thử JSON nguyên khối trước (mảng, hoặc object bọc ngoài 1 mảng).
+        try:
+            parsed = json.loads(stripped)
+            if isinstance(parsed, list):
+                return parsed
+            if isinstance(parsed, dict):
+                for value in parsed.values():
+                    if isinstance(value, list):
+                        return value
+            raise ValueError(
+                f"JSON hợp lệ nhưng không tìm thấy list entry nào trong {resolved}"
+            )
+        except json.JSONDecodeError:
+            pass
+
+        # Không phải JSON nguyên khối hợp lệ -- thử JSONL (mỗi dòng 1 object).
+        entries = [json.loads(line) for line in stripped.splitlines() if line.strip()]
+        if not entries:
+            raise ValueError(f"Không parse được metadata (thử cả JSON và JSONL): {resolved}")
+        return entries
 
     @staticmethod
     def _load_id_map(path: str) -> np.ndarray:

@@ -4,8 +4,6 @@ import time
 from dataclasses import dataclass, replace, asdict
 
 import numpy as np
-import open_clip
-import torch
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
 
@@ -25,10 +23,11 @@ class Candidate:
 
 
 class TextEmbedder:
-    """Encode câu truy vấn text sang vector BGE-small (384-dim), dùng cho
-    faiss_text.index (caption + asr gộp chung)."""
+    """Encode câu truy vấn text sang vector (384-dim), dùng cho faiss_text.index
+    (caption + asr gộp chung).
+    """
 
-    def __init__(self, model_name="BAAI/bge-small-en-v1.5", device="cpu"):
+    def __init__(self, model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2", device="cpu"):
         self.model = SentenceTransformer(model_name, device=device)
 
     def encode(self, text: str) -> np.ndarray:
@@ -39,25 +38,17 @@ class TextEmbedder:
 class ClipQueryEmbedder:
     """Encode câu truy vấn text sang vector CLIP (512-dim), dùng cho
     faiss_clip.index (ảnh keyframe) -- cùng không gian embedding với ảnh
-    nên có thể query text -> ảnh trực tiếp."""
+    nên có thể query text -> ảnh trực tiếp.
+    """
 
-    def __init__(self, model_name="ViT-B-32", pretrained="openai", device="cpu"):
-        # Phải khớp scripts/14_search_clip.py của pipeline nguồn.
-        # Không dùng SentenceTransformer("clip-ViT-B-32") ở đây vì đó là
-        # encoder implementation/checkpoint khác với OpenCLIP dùng để search.
-        self.device = device
-        self.model, _, _ = open_clip.create_model_and_transforms(
-            model_name, pretrained=pretrained
-        )
-        self.tokenizer = open_clip.get_tokenizer(model_name)
-        self.model.to(device).eval()
+    def __init__(self, model_name="clip-ViT-B-32-multilingual-v1", device="cpu"):
+        self.model = SentenceTransformer(model_name, device=device)
 
     def encode(self, text: str) -> np.ndarray:
-        with torch.no_grad():
-            tokens = self.tokenizer([text]).to(self.device)
-            vector = self.model.encode_text(tokens)
-            vector = vector / vector.norm(dim=-1, keepdim=True)
-        return vector.cpu().numpy().astype("float32")[0]
+        """Trả về vector float32 đã normalize (để dùng inner product = cosine),
+        khớp đúng normalize=True lúc build index (metric cosine qua inner product)."""
+        vector = self.model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
+        return np.asarray(vector, dtype="float32")
 
 
 class Retriever:
@@ -275,7 +266,10 @@ class Reranker:
 class GroqClient:
     """Wrapper gọi Groq API (LLM free-tier) để sinh câu trả lời cho Q&A."""
 
-    DEFAULT_MODEL = "llama-3.3-70b-versatile"
+    # Groq đã deprecate llama-3.3-70b-versatile (thông báo 17/6/2026);
+    # openai/gpt-oss-120b là model thay thế được Groq khuyến nghị.
+    # Có thể override bằng biến môi trường GROQ_MODEL nếu Groq đổi model lần nữa.
+    DEFAULT_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
     def __init__(self, model=None, api_key=None, temperature=0.2, max_tokens=1024):
         from groq import Groq
@@ -352,17 +346,18 @@ class RagPipeline:
         self.top_n_rerank = top_n_rerank
         self.fast_kis = fast_kis
 
-    def run_kis(self, query: str) -> list[dict]:
+    def run_kis(self, query: str, top_n: int | None = None) -> list[dict]:
         """KIS; có thể bỏ CrossEncoder bằng ``RAG_FAST_KIS=1``."""
+        top_n = top_n if top_n is not None else self.top_n_rerank
         started = time.perf_counter()
         cands = self.retriever.search(query, top_k=self.top_k_retrieve)
         fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager)
         if self.fast_kis:
-            results = [self._public_candidate(c) for c in fused[:self.top_n_rerank]]
+            results = [self._public_candidate(c) for c in fused[:top_n]]
         else:
             results = [self._public_result(r)
                        for r in self.reranker.rerank(
-                           query, fused, top_n=self.top_n_rerank
+                           query, fused, top_n=top_n
                        )]
         if os.environ.get("RAG_PROFILE", "0") == "1":
             print(
@@ -371,25 +366,74 @@ class RagPipeline:
             )
         return results
 
-    def run_qa(self, query: str) -> dict:
+    def run_qa(self, query: str, top_n: int | None = None) -> dict:
         """Q&A/VQA -- đi tiếp bước gọi LLM sinh câu trả lời tự nhiên,
         kèm sources đã rerank để hiển thị bằng chứng."""
+        top_n = top_n if top_n is not None else self.top_n_rerank
         if self.llm_client is None:
             raise ValueError("run_qa() cần llm_client (GroqClient) -- KIS thì không cần.")
         cands = self.retriever.search(query, top_k=self.top_k_retrieve)
         fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager)
-        reranked = self.reranker.rerank(query, fused, top_n=self.top_n_rerank)
+        reranked = self.reranker.rerank(query, fused, top_n=top_n)
         return {"answer": build_qa_answer(query, reranked, self.llm_client),
                 "sources": [self._public_result(r) for r in reranked]}
 
-    def run_trake(self, events: list[str]) -> list[list[dict]]:
-        """TRAKE (multi-event/temporal) -- search+rerank riêng từng event,
-        CHƯA align timestamp giữa các event trong cùng 1 video (TODO)."""
+    _ALIGN_POOL_MULTIPLIER = 3
+    _MAX_ALIGN_POOL = 50
+
+    @staticmethod
+    def _align_trake_events(events_results: list) -> list:
+        """Ưu tiên chuỗi frame có timestamp tăng dần khớp đúng thứ tự event,
+        trong cùng 1 video (đây là ý nghĩa thực sự của TRAKE).
+
+        Với mỗi video xuất hiện trong TẤT CẢ các event, chọn tham lam khung
+        hình sớm nhất có timestamp lớn hơn khung hình đã chọn ở event trước.
+        Nếu tìm được chuỗi hợp lệ cho video đó, các candidate thuộc chuỗi
+        được đẩy lên đầu danh sách kết quả của từng event; các candidate còn
+        lại giữ nguyên thứ tự rerank cũ ở phía sau.
+        """
+        if len(events_results) < 2:
+            return events_results
+
+        video_sets = [set(r.video_id for r in ev) for ev in events_results]
+        common_videos = set.intersection(*video_sets) if all(video_sets) else set()
+
+        aligned_ids_per_event = [set() for _ in events_results]
+        for video_id in common_videos:
+            prev_ts = float("-inf")
+            chosen = []
+            for ev in events_results:
+                candidates = [r for r in ev if r.video_id == video_id and r.timestamp > prev_ts]
+                if not candidates:
+                    chosen = []
+                    break
+                best = min(candidates, key=lambda r: r.timestamp)
+                chosen.append(best)
+                prev_ts = best.timestamp
+            if chosen:
+                for idx, r in enumerate(chosen):
+                    aligned_ids_per_event[idx].add(r.frame_id)
+
+        aligned_results = []
+        for ev, aligned_ids in zip(events_results, aligned_ids_per_event):
+            aligned = [r for r in ev if r.frame_id in aligned_ids]
+            rest = [r for r in ev if r.frame_id not in aligned_ids]
+            aligned_results.append(aligned + rest)
+        return aligned_results
+
+    def run_trake(self, events: list[str], top_n: int | None = None) -> list[list[dict]]:
+        """TRAKE (multi-event/temporal) -- search+rerank riêng từng event, sau đó
+        align timestamp giữa các event trong cùng video để ưu tiên đúng chuỗi
+        sự kiện theo thứ tự thời gian."""
+        top_n = top_n if top_n is not None else self.top_n_rerank
+        pool_n = min(max(top_n * self._ALIGN_POOL_MULTIPLIER, top_n), self._MAX_ALIGN_POOL)
         cands_per_event = self.retriever.search_events(events, top_k=self.top_k_retrieve)
         fused_per_event = [merge(c, query=e, sqlite_manager=self.retriever.sqlite_manager)
                             for c, e in zip(cands_per_event, events)]
-        reranked = self.reranker.rerank_events(events, fused_per_event, top_n=self.top_n_rerank)
-        return [[self._public_result(r) for r in ev] for ev in reranked]
+        reranked = self.reranker.rerank_events(events, fused_per_event, top_n=pool_n)
+        aligned = self._align_trake_events(reranked)
+        truncated = [ev[:top_n] for ev in aligned]
+        return [[self._public_result(r) for r in ev] for ev in truncated]
 
     def run(self, query_type: str, query: str = None, events: list[str] = None):
         """Entry point chung, chọn nhánh xử lý theo query_type ("KIS"|"QA"|"VQA"|"TRAKE")."""

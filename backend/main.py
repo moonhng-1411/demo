@@ -4,13 +4,14 @@ routers/, dependencies dùng chung nằm trong dependencies.py."""
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import retrieval, media
+from routers import retrieval, media, admin
 
 app = FastAPI(title="AIC26 RAG API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 app.include_router(retrieval.router)
 app.include_router(media.router)
+app.include_router(admin.router)
 
 
 @app.get("/api/health")
