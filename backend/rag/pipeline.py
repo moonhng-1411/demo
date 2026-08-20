@@ -12,11 +12,14 @@ class Candidate:
     """Một kết quả retrieval thô, trước khi fusion.
 
     ``frame_id`` chỉ dùng nội bộ để join database; ``frame_idx`` là chỉ số
-    frame theo video và là field công khai cho frontend.
+    frame theo video; ``n`` là số thứ tự keyframe trong video (bắt đầu từ 1,
+    dùng để dựng tên ảnh MinIO như "084.jpg") -- đây là field hiển thị làm
+    "Keyframe ID" trên frontend, khác với keyframe_id toàn cục trong SQLite.
     """
     frame_id: int
     video_id: str
     frame_idx: int
+    n: int
     timestamp: float
     score: float
     modality: str
@@ -39,6 +42,14 @@ class ClipQueryEmbedder:
     """Encode câu truy vấn text sang vector CLIP (512-dim), dùng cho
     faiss_clip.index (ảnh keyframe) -- cùng không gian embedding với ảnh
     nên có thể query text -> ảnh trực tiếp.
+
+    Dùng clip-ViT-B-32-multilingual-v1 (sentence-transformers) chứ KHÔNG
+    dùng thẳng OpenAI CLIP ViT-B/32 gốc, vì caption/query trong hệ thống là
+    tiếng Việt -- text encoder gốc của OpenAI CLIP chỉ hiểu tiếng Anh.
+    Model multilingual này được distill riêng để giữ đúng không gian
+    embedding ảnh của OpenAI CLIP ViT-B/32 (khớp checkpoint "BTC provided"
+    dùng lúc build faiss_clip.index) trong khi text encoder hiểu đa ngôn
+    ngữ bao gồm tiếng Việt.
     """
 
     def __init__(self, model_name="clip-ViT-B-32-multilingual-v1", device="cpu"):
@@ -87,7 +98,7 @@ class Retriever:
 
         info = self.sqlite_manager.get_frame_info(int(frame_id))
         return Candidate(
-            int(frame_id), info["video_id"], info["frame_idx"], info["pts_time"],
+            int(frame_id), info["video_id"], info["frame_idx"], info["n"], info["pts_time"],
             float(score), modality,
         )
 
@@ -96,7 +107,7 @@ class Retriever:
         clip_id_map.npy) thành Candidate."""
         info = self.sqlite_manager.get_frame_info(frame_id)
         return Candidate(
-            int(frame_id), info["video_id"], info["frame_idx"], info["pts_time"],
+            int(frame_id), info["video_id"], info["frame_idx"], info["n"], info["pts_time"],
             float(score), "visual",
         )
 
@@ -201,11 +212,13 @@ class RerankedResult:
     """Kết quả nội bộ sau cross-encoder rerank.
 
     ``frame_id`` giữ lại để lấy caption/ASR và ảnh; response API sẽ loại field
-    này và chỉ công khai video_id, frame_idx, score.
+    này và chỉ công khai video_id, frame_idx, n (hiển thị "Keyframe ID" trên
+    frontend), score.
     """
     frame_id: int
     video_id: str
     frame_idx: int
+    n: int
     timestamp: float
     rerank_score: float
     document_text: str
@@ -213,10 +226,20 @@ class RerankedResult:
 
 class Reranker:
     """Rerank list candidate đã fusion bằng cross-encoder, dựa trên văn bản
-    tổng hợp (caption + ocr + asr) của từng frame."""
+    tổng hợp (caption + ocr + asr) của từng frame.
+
+    Dùng cross-encoder/mmarco-mMiniLMv2-L12-H384-v1 (multilingual, train
+    trên mMARCO -- bản dịch máy MS MARCO sang 14 ngôn ngữ, có tiếng Việt)
+    thay vì cross-encoder/ms-marco-MiniLM-L-6-v2 gốc (chỉ train tiếng Anh).
+    Query trong hệ thống là tiếng Việt còn document_text/caption chủ yếu là
+    tiếng Anh (auto-caption BLIP-style) -- cross-encoder gốc không đáng tin
+    cậy cho cặp (query Việt, doc Anh) vì chưa từng thấy dữ liệu liên ngôn
+    ngữ lúc train, có thể làm rerank ngẫu nhiên/nhiễu ở bước cuối cùng
+    quyết định thứ tự kết quả.
+    """
 
     def __init__(self, sqlite_manager, cross_encoder=None,
-                 model_name="cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu"):
+                 model_name="cross-encoder/mmarco-mMiniLMv2-L12-H384-v1", device="cpu"):
         self.sqlite_manager = sqlite_manager
         self.cross_encoder = cross_encoder or CrossEncoder(model_name, device=device)
 
@@ -252,7 +275,7 @@ class Reranker:
         scores = [float(s) for s in self.cross_encoder.predict(pairs)]
 
         results = [RerankedResult(
-            c.frame_id, c.video_id, c.frame_idx, c.timestamp, score, d
+            c.frame_id, c.video_id, c.frame_idx, c.n, c.timestamp, score, d
         ) for (c, d), score in zip(valid, scores)]
         results.sort(key=lambda r: r.rerank_score, reverse=True)
         return results[:top_n]
@@ -321,19 +344,23 @@ class RagPipeline:
 
     @staticmethod
     def _public_result(result: RerankedResult) -> dict:
-        """Response sau CrossEncoder; không lộ keyframe_id nội bộ."""
+        """Response sau CrossEncoder. keyframe_id hiển thị là ``n`` (số thứ
+        tự keyframe trong video, format 3 chữ số như tên file ảnh trên
+        MinIO), KHÔNG phải id toàn cục trong SQLite."""
         return {
             "video_id": result.video_id,
             "frame_idx": result.frame_idx,
+            "keyframe_id": f"{result.n:03d}",
             "score": float(result.rerank_score),
         }
 
     @staticmethod
     def _public_candidate(candidate: Candidate) -> dict:
-        """Response nhanh dùng điểm fusion, không chạy CrossEncoder."""
+        """Response nhanh dùng điểm fusion (fast_kis), không chạy CrossEncoder."""
         return {
             "video_id": candidate.video_id,
             "frame_idx": candidate.frame_idx,
+            "keyframe_id": f"{candidate.n:03d}",
             "score": float(candidate.score),
         }
 

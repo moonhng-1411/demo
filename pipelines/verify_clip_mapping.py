@@ -2,10 +2,20 @@
 
 Hai lớp kiểm tra:
 1) mapping: row của FAISS -> keyframe_id từ id_map.json (chỉ đọc, không suy đoán).
-2) semantic (--semantic): text caption -> ảnh CLIP, dùng open_clip OpenAI
-   ViT-B/32 (khớp checkpoint BTC dùng lúc build) -- không phải bằng chứng
-   tuyệt đối cho mapping vì caption không phải vector ảnh gốc, nhưng đủ tin
-   cậy để xác nhận (đã chạy: 18/20 hit).
+2) semantic (--semantic): text caption -> ảnh CLIP.
+
+   Caption trong DB là tiếng Việt, nên dùng clip-ViT-B-32-multilingual-v1
+   (sentence-transformers) để encode -- ĐÚNG model mà backend production
+   dùng (xem backend/rag/pipeline.py::ClipQueryEmbedder), không dùng thẳng
+   text encoder gốc của OpenAI CLIP (chỉ hiểu tiếng Anh, sẽ cho hit rate
+   thấp giả tạo dù index/mapping hoàn toàn đúng). Model multilingual này
+   được distill để giữ đúng không gian embedding ảnh của OpenAI CLIP
+   ViT-B/32 (khớp checkpoint "BTC provided" dùng lúc build faiss_clip.index).
+
+   Không phải bằng chứng tuyệt đối cho mapping vì caption không phải vector
+   ảnh gốc, nhưng đủ tin cậy để xác nhận -- nếu hit thấp bất thường dù
+   verify_clip_self_consistency.py đã PASS, khả năng cao là do caption
+   diễn đạt khác với nội dung ảnh hơn là do mapping sai.
 
 Dùng:
     python -m pipelines.verify_clip_mapping --semantic
@@ -18,13 +28,12 @@ import sqlite3
 
 import faiss
 import numpy as np
-import open_clip
-import torch
+from sentence_transformers import SentenceTransformer
 
 from pipelines.clip_mapping import load_clip_id_map
 from pipelines.config import DB_PATH, INDEX_ROOT
 
-MODEL_NAME = "clip-ViT-B-32 / openai"
+MODEL_NAME = "clip-ViT-B-32-multilingual-v1"
 
 
 def _paths(cli_index=None, cli_map=None):
@@ -62,8 +71,17 @@ def check_mapping(index_path: str, map_path: str) -> np.ndarray:
 
 
 def run_semantic_test(index, id_map: np.ndarray, sample: int, top_k: int):
-    """Encode caption bằng open_clip OpenAI ViT-B/32 (đúng checkpoint BTC dùng
-    lúc build), query vào index, so rank với expected_row theo id_map."""
+    """Encode caption tiếng Việt bằng clip-ViT-B-32-multilingual-v1 (đúng
+    model backend production dùng), query vào index, so rank với
+    expected_row theo id_map.
+
+    In thêm video_id của expected_row và của top-1 để phân biệt 2 tình
+    huống: (a) top-1 khác video hoàn toàn -> nghi ngờ semantic thật sự yếu
+    hoặc mapping sai; (b) top-1 CÙNG video_id với expected -> gần như chắc
+    chắn là false-negative do 2 keyframe liền kề trong cùng video trông
+    gần giống hệt nhau (rất bình thường với keyframe sampling dày), không
+    phải bug.
+    """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
@@ -71,14 +89,18 @@ def run_semantic_test(index, id_map: np.ndarray, sample: int, top_k: int):
         "WHERE caption_text IS NOT NULL AND caption_text != '' "
         "ORDER BY RANDOM() LIMIT ?", (sample,)
     ).fetchall()
-    conn.close()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, _, _ = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
-    tokenizer = open_clip.get_tokenizer("ViT-B-32")
-    model.to(device).eval()
+    def video_of(keyframe_id: int):
+        row = conn.execute(
+            "SELECT video_id FROM keyframes WHERE id = ?", (keyframe_id,)
+        ).fetchone()
+        return row["video_id"] if row else None
+
+    device = "cpu"
+    model = SentenceTransformer(MODEL_NAME, device=device)
 
     semantic_hits = 0
+    same_video_near_miss = 0
     for r in rows:
         keyframe_id = int(r["keyframe_id"])
         matches = np.flatnonzero(id_map == keyframe_id)
@@ -87,11 +109,8 @@ def run_semantic_test(index, id_map: np.ndarray, sample: int, top_k: int):
             continue
         expected_row = int(matches[0])
 
-        with torch.no_grad():
-            tokens = tokenizer([r["caption_text"]]).to(device)
-            q_tensor = model.encode_text(tokens)
-            q_tensor = q_tensor / q_tensor.norm(dim=-1, keepdim=True)
-            q = q_tensor.cpu().numpy().astype("float32")
+        q = model.encode(r["caption_text"], convert_to_numpy=True, normalize_embeddings=True)
+        q = q.reshape(1, -1).astype("float32")
 
         scores, idxs = index.search(q, max(top_k, 1))
         top_rows = idxs[0].tolist()
@@ -102,13 +121,25 @@ def run_semantic_test(index, id_map: np.ndarray, sample: int, top_k: int):
         rank = top_rows.index(expected_row) + 1 if found else None
         preview = [(int(row), int(id_map[row]), round(float(score), 4))
                    for row, score in zip(top_rows[:5], top_scores[:5])]
+
+        expected_video = video_of(keyframe_id)
+        top1_keyframe_id = int(id_map[top_rows[0]])
+        top1_video = video_of(top1_keyframe_id)
+        near_miss = (not found) and (top1_video == expected_video)
+        same_video_near_miss += near_miss
+
         print(
-            f"keyframe_id={keyframe_id}, expected_row={expected_row}, "
+            f"keyframe_id={keyframe_id} (video={expected_video}), expected_row={expected_row}, "
             f"expected_score={expected_score:.4f}, rank={rank}, top5={preview}\n"
+            f"  top1_video={top1_video}"
+            f"{'  <- CÙNG VIDEO với expected (near-miss do frame liền kề, không phải bug)' if near_miss else ''}\n"
             f"  caption={r['caption_text'][:100]!r}"
         )
 
+    conn.close()
     print(f"\nsemantic caption hit@{top_k}: {semantic_hits}/{len(rows)}")
+    print(f"trong số miss, số case top1 CÙNG video (near-miss do frame liền kề): "
+          f"{same_video_near_miss}/{len(rows) - semantic_hits}")
     print("Lưu ý: hit thấp chỉ chứng minh caption-text không kéo đúng ảnh vào top-k; "
           "không tự chứng minh id_map sai. Để verify mapping tuyệt đối cần encode lại "
           "ảnh keyframe bằng đúng image encoder/preprocessing đã tạo index.")
