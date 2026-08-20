@@ -31,8 +31,11 @@ if "cache" not in st.session_state:
     st.session_state.cache = {}
 
 
-def _run_query(mode_key: str, spinner_text: str, fetch_fn):
-    """Gọi API, lưu kết quả + thời gian vào session_state.cache[mode_key]."""
+def _run_query(mode_key: str, spinner_text: str, fetch_fn, top_n: int, query_key):
+    """Gọi API, lưu kết quả + thời gian + top_n/query đã dùng vào session_state.cache[mode_key].
+
+    query_key được lưu lại để có thể refetch tự động khi top_n đổi mà
+    form KHÔNG được submit lại (xem _maybe_refetch)."""
     with st.spinner(spinner_text):
         try:
             started = time.perf_counter()
@@ -42,9 +45,30 @@ def _run_query(mode_key: str, spinner_text: str, fetch_fn):
                 "payload": payload,
                 "api_elapsed": api_elapsed,
                 "error": None,
+                "top_n": top_n,
+                "query_key": query_key,
             }
         except Exception as e:
-            st.session_state.cache[mode_key] = {"payload": None, "api_elapsed": None, "error": str(e)}
+            st.session_state.cache[mode_key] = {
+                "payload": None, "api_elapsed": None, "error": str(e),
+                "top_n": top_n, "query_key": query_key,
+            }
+
+
+def _maybe_refetch(mode_key: str, new_query, top_n: int, spinner_text: str, fetch_fn, query_key=None):
+    """Quyết định có cần gọi lại API hay không, và gọi nếu cần.
+
+    - new_query có giá trị (vừa bấm nút submit) -> luôn fetch với query mới.
+    - new_query là None (rerun do đổi slider/n_cols) nhưng đã có cache trước
+      đó với top_n khác -> refetch lại bằng query đã lưu trong cache, để
+      slider "Số kết quả" có tác dụng ngay cả khi không bấm lại nút Tìm.
+    """
+    cached = st.session_state.cache.get(mode_key)
+    if new_query:
+        _run_query(mode_key, spinner_text, fetch_fn, top_n, query_key if query_key is not None else new_query)
+    elif cached is not None and cached.get("error") is None and cached.get("top_n") != top_n:
+        st.session_state.cache[mode_key]["top_n"] = top_n  # tránh loop nếu fetch_fn ném lỗi
+        _run_query(mode_key, spinner_text, fetch_fn, top_n, cached.get("query_key"))
 
 
 def _render_cached(mode_key: str, render_fn):
@@ -62,14 +86,26 @@ def _render_cached(mode_key: str, render_fn):
 
 if mode == "KIS":
     query = render_kis_input()
-    if query:
-        _run_query("KIS", "Đang tìm...", lambda: api.search_kis(query, top_n=top_n, translate=translate))
+    cached_kis = st.session_state.cache.get("KIS")
+    effective_query = query or (cached_kis.get("query_key") if cached_kis else None)
+    if effective_query:
+        _maybe_refetch(
+            "KIS", query, top_n, "Đang tìm...",
+            lambda: api.search_kis(effective_query, top_n=top_n, translate=translate),
+            query_key=effective_query,
+        )
     _render_cached("KIS", lambda results: render_results(results, api, n_cols))
 
 elif mode == "Q&A":
     query = render_qa_input()
-    if query:
-        _run_query("QA", "Đang suy nghĩ...", lambda: api.ask_qa(query, top_n=top_n, translate=translate))
+    cached_qa = st.session_state.cache.get("QA")
+    effective_query = query or (cached_qa.get("query_key") if cached_qa else None)
+    if effective_query:
+        _maybe_refetch(
+            "QA", query, top_n, "Đang suy nghĩ...",
+            lambda: api.ask_qa(effective_query, top_n=top_n, translate=translate),
+            query_key=effective_query,
+        )
 
     def _render_qa(data):
         st.markdown(f"### Trả lời\n{data['answer']}")
@@ -80,10 +116,16 @@ elif mode == "Q&A":
 
 elif mode == "TRAKE":
     events = render_trake_input()
-    if events:
-        _run_query(
-            "TRAKE", "Đang tìm...",
-            lambda: {"events": events, "results_per_event": api.search_trake(events, top_n=top_n, translate=translate)},
+    cached_trake = st.session_state.cache.get("TRAKE")
+    effective_events = events or (cached_trake.get("query_key") if cached_trake else None)
+    if effective_events:
+        _maybe_refetch(
+            "TRAKE", events, top_n, "Đang tìm...",
+            lambda: {
+                "events": effective_events,
+                "results_per_event": api.search_trake(effective_events, top_n=top_n, translate=translate),
+            },
+            query_key=effective_events,
         )
 
     def _render_trake(payload):
