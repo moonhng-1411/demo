@@ -113,6 +113,10 @@ elif mode == "Q&A":
         )
 
     def _render_qa(data):
+        reasoning = (data.get("reasoning") or "").strip()
+        if reasoning:
+            with st.expander("Đang suy nghĩ...", expanded=False):
+                st.markdown(reasoning)
         st.markdown(f"### Trả lời\n{data['answer']}")
         st.divider()
         render_results(data["sources"], api, n_cols)

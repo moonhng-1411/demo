@@ -345,16 +345,19 @@ class Retriever:
                 frame_lookup.setdefault(fid, c)
                 accum["visual"][fid] = accum["visual"].get(fid, 0.0) + weight * rrf[fid]
 
-        text_vec = self.text_embedder.encode(query)
-        text_encoded = time.perf_counter()
-        _accumulate_text(list(self.faiss_manager.search_text(text_vec, top_k=top_k)), weight=1.0)
-        text_searched = time.perf_counter()
-
-        clip_vec = self.clip_embedder.encode(query)
-        clip_encoded = time.perf_counter()
-        _accumulate_clip(list(self.faiss_manager.search_clip(clip_vec, top_k=top_k)), weight=1.0)
-        finished = time.perf_counter()
-
+        # QUAN TRỌNG: text_embedder/clip_embedder ở đây là CLIP ViT-B/32 bản
+        # gốc "openai" (xem dependencies.py) -- encoder này KHÔNG multilingual,
+        # chỉ hiểu tiếng Anh (xem cảnh báo trong docstring ClipQueryEmbedder).
+        # Caption/ASR lưu trong hệ thống cũng 100% tiếng Anh (auto-caption
+        # kiểu BLIP -- xem docstring Reranker). Vì vậy phải dịch TRƯỚC khi
+        # quyết định có search bằng câu gốc hay không: nếu dịch được, encode
+        # + search thẳng bằng câu TIẾNG VIỆT GỐC qua encoder này hoàn toàn vô
+        # nghĩa (không phải "yếu", mà gần như thuần nhiễu) -- BỎ HẲN lượt đó,
+        # chỉ giữ lại lượt search bằng bản dịch tiếng Anh, tránh vừa tốn
+        # compute vừa đưa nhiễu vào RRF fusion pha loãng kết quả đúng.
+        # Chỉ khi KHÔNG dịch được (không có translator, hoặc translate=False)
+        # mới fallback search bằng câu gốc ở trọng số đầy đủ 1.0 -- còn hơn
+        # không search gì.
         translated = None
         if self.translator is not None and translate:
             try:
@@ -363,12 +366,26 @@ class Retriever:
                 translated = None
                 if profile:
                     print(f"[RAG_PROFILE] translate lỗi, bỏ qua: {e}")
+        translate_call_done = time.perf_counter()
+
+        if translated is None:
+            text_vec = self.text_embedder.encode(query)
+            text_encoded = time.perf_counter()
+            _accumulate_text(list(self.faiss_manager.search_text(text_vec, top_k=top_k)), weight=1.0)
+            text_searched = time.perf_counter()
+
+            clip_vec = self.clip_embedder.encode(query)
+            clip_encoded = time.perf_counter()
+            _accumulate_clip(list(self.faiss_manager.search_clip(clip_vec, top_k=top_k)), weight=1.0)
+            finished = time.perf_counter()
+        else:
+            text_encoded = text_searched = clip_encoded = finished = translate_call_done
 
         if translated:
             en_text_vec = self.text_embedder.encode(translated)
-            _accumulate_text(list(self.faiss_manager.search_text(en_text_vec, top_k=top_k)), weight=0.9)
+            _accumulate_text(list(self.faiss_manager.search_text(en_text_vec, top_k=top_k)), weight=1.0)
             en_clip_vec = self.clip_embedder.encode(translated)
-            _accumulate_clip(list(self.faiss_manager.search_clip(en_clip_vec, top_k=top_k)), weight=0.9)
+            _accumulate_clip(list(self.faiss_manager.search_clip(en_clip_vec, top_k=top_k)), weight=1.0)
         translate_done = time.perf_counter()
 
         is_long_query = len(_tokenize(query)) > self._LONG_QUERY_TOKEN_THRESHOLD
@@ -400,11 +417,24 @@ class Retriever:
         if is_long_query:
             for clause in self._split_clauses(query):
                 num_clauses += 1
-                clause_text_vec = self.text_embedder.encode(clause)
+                # Cùng lý do với pass chính ở trên: encoder chỉ hiểu tiếng
+                # Anh, caption/ASR toàn bộ tiếng Anh -- clause tiếng Việt gốc
+                # phải dịch trước khi encode, không thì chỉ thêm nhiễu vào
+                # RRF fusion. translator.translate() có cache nên nếu trùng
+                # clause đã dịch ở nơi khác cũng không tốn thêm request.
+                clause_query = clause
+                if self.translator is not None and translate:
+                    try:
+                        clause_query = self.translator.translate(clause)
+                    except Exception as e:
+                        clause_query = clause
+                        if profile:
+                            print(f"[RAG_PROFILE] dịch clause lỗi, bỏ qua: {e}")
+                clause_text_vec = self.text_embedder.encode(clause_query)
                 _accumulate_text(
                     list(self.faiss_manager.search_text(clause_text_vec, top_k=top_k // 2)), weight=0.7
                 )
-                clause_clip_vec = self.clip_embedder.encode(clause)
+                clause_clip_vec = self.clip_embedder.encode(clause_query)
                 _accumulate_clip(
                     list(self.faiss_manager.search_clip(clause_clip_vec, top_k=top_k // 2)), weight=0.7
                 )
@@ -419,7 +449,8 @@ class Retriever:
         if profile:
             print(
                 "[RAG_PROFILE] "
-                f"text_encode={text_encoded-started:.2f}s "
+                f"translate_call={translate_call_done-started:.2f}s "
+                f"text_encode={text_encoded-translate_call_done:.2f}s "
                 f"text_search_map={text_searched-text_encoded:.2f}s "
                 f"clip_encode={clip_encoded-text_searched:.2f}s "
                 f"clip_search_map={finished-clip_encoded:.2f}s "
@@ -508,6 +539,12 @@ def merge(candidates_by_modality: dict, query: str = None, sqlite_manager=None,
     """Gộp candidate từ nhiều modality (caption/asr/visual) thành 1 list đã
     xếp hạng theo fused score = RRF theo từng modality (có trọng số) +
     object_weight * object_score (nếu có query + sqlite_manager + text_embedder).
+
+    QUAN TRỌNG: ``query`` truyền vào đây sẽ được ``text_embedder`` (CLIP
+    ViT-B/32 "openai", KHÔNG multilingual) encode để so khớp nhãn object
+    (tiếng Anh) -- nên truyền bản dịch tiếng Anh nếu có (xem RagPipeline.run_kis/
+    run_qa), không phải câu tiếng Việt gốc, nếu không object score sẽ luôn
+    ~0 vì encoder không hiểu tiếng Việt.
 
     Trả về list[Candidate] với modality="fused", sort giảm dần theo score.
     """
@@ -650,15 +687,24 @@ class GroqClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
 
-    def generate_answer(self, system_prompt: str, user_prompt: str) -> str:
-        """Gọi Groq chat completion, trả về text câu trả lời."""
+    def generate_answer(self, system_prompt: str, user_prompt: str) -> dict:
+        """Gọi Groq chat completion, trả về {"answer", "reasoning"}.
+
+        gpt-oss-120b mặc định trả kèm nội dung suy luận (chain-of-thought)
+        riêng trong field ``reasoning`` của message -- tách biệt với
+        ``content`` (câu trả lời cuối). Field này có thể rỗng/None với các
+        model không hỗ trợ reasoning."""
         r = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "system", "content": system_prompt},
                       {"role": "user", "content": user_prompt}],
             temperature=self.temperature, max_tokens=self.max_tokens,
         )
-        return r.choices[0].message.content
+        message = r.choices[0].message
+        return {
+            "answer": message.content,
+            "reasoning": getattr(message, "reasoning", None),
+        }
 
 
 SYSTEM_PROMPT_QA = (
@@ -678,11 +724,14 @@ def _format_context(results: list) -> str:
     )
 
 
-def build_qa_answer(query: str, results: list, llm_client: GroqClient) -> str:
-    """Sinh câu trả lời Q&A từ context đã rerank. Trả về thông báo cố định
-    nếu không có kết quả nào (tránh gọi LLM vô ích khi chắc chắn không đủ ngữ cảnh)."""
+def build_qa_answer(query: str, results: list, llm_client: GroqClient) -> dict:
+    """Sinh câu trả lời Q&A từ context đã rerank. Trả về {"answer", "reasoning"};
+    reasoning=None khi trả lời cố định (không đủ ngữ cảnh, tránh gọi LLM vô ích)."""
     if not results:
-        return "Không tìm thấy thông tin liên quan trong video để trả lời câu hỏi này."
+        return {
+            "answer": "Không tìm thấy thông tin liên quan trong video để trả lời câu hỏi này.",
+            "reasoning": None,
+        }
     prompt = f"NGỮ CẢNH:\n{_format_context(results)}\n\nCÂU HỎI: {query}\n\n"
     return llm_client.generate_answer(SYSTEM_PROMPT_QA, prompt)
 
@@ -722,6 +771,22 @@ class RagPipeline:
         self.top_n_rerank = top_n_rerank
         self.fast_kis = fast_kis
 
+    @staticmethod
+    def _object_score_query(query: str, translator) -> str:
+        """Trả về text tiếng Anh để merge() dùng chấm object score.
+
+        text_embedder truyền vào merge() là CLIP ViT-B/32 "openai", KHÔNG
+        multilingual -- object_score luôn ~0 nếu đưa thẳng câu tiếng Việt
+        gốc vào (xem docstring merge()). translator.translate() có cache
+        nội bộ nên gọi lại ở đây (sau khi Retriever.search() đã dịch cùng
+        query) không tốn thêm request Groq."""
+        if translator is None:
+            return query
+        try:
+            return translator.translate(query)
+        except Exception:
+            return query
+
     def run_kis(self, query: str, top_n: int | None = None, translate: bool = True) -> list[dict]:
         """KIS; có thể bỏ CrossEncoder bằng ``RAG_FAST_KIS=1``.
 
@@ -731,7 +796,8 @@ class RagPipeline:
         translator = self.retriever.translator if translate else None
         started = time.perf_counter()
         cands = self.retriever.search(query, top_k=self.top_k_retrieve, translate=translate)
-        fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager,
+        fused = merge(cands, query=self._object_score_query(query, translator),
+                      sqlite_manager=self.retriever.sqlite_manager,
                       text_embedder=self.retriever.text_embedder)
         if self.fast_kis:
             results = [self._public_candidate(c) for c in fused[:top_n]]
@@ -755,11 +821,16 @@ class RagPipeline:
             raise ValueError("run_qa() cần llm_client (GroqClient) -- KIS thì không cần.")
         translator = self.retriever.translator if translate else None
         cands = self.retriever.search(query, top_k=self.top_k_retrieve, translate=translate)
-        fused = merge(cands, query=query, sqlite_manager=self.retriever.sqlite_manager,
+        fused = merge(cands, query=self._object_score_query(query, translator),
+                      sqlite_manager=self.retriever.sqlite_manager,
                       text_embedder=self.retriever.text_embedder)
         reranked = self.reranker.rerank(query, fused, top_n=top_n, translator=translator)
-        return {"answer": build_qa_answer(query, reranked, self.llm_client),
-                "sources": [self._public_result(r) for r in reranked]}
+        qa_result = build_qa_answer(query, reranked, self.llm_client)
+        return {
+            "answer": qa_result["answer"],
+            "reasoning": qa_result["reasoning"],
+            "sources": [self._public_result(r) for r in reranked],
+        }
 
     _ALIGN_POOL_MULTIPLIER = 3
     _MAX_ALIGN_POOL = 50
