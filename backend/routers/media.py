@@ -2,7 +2,7 @@
 
 import os
 from fastapi import APIRouter, HTTPException, Depends
-from fastapi.responses import RedirectResponse
+from fastapi.responses import StreamingResponse
 from minio import Minio
 from minio.error import S3Error
 
@@ -89,7 +89,11 @@ def _redirect_if_available(
     info: dict,
     video_id: str,
     minio_client: Minio,
-) -> RedirectResponse:
+):
+    """Proxy bytes ảnh qua backend thay vì redirect trình duyệt ra thẳng
+    MinIO/ngrok -- request browser-to-ngrok trực tiếp bị chặn bởi trang
+    cảnh báo interstitial của ngrok free tier (chỉ chặn traffic có vẻ đến
+    từ browser, request server-to-server qua minio SDK thì không bị)."""
     location = _find_uploaded_image(info, video_id, minio_client)
     if location is None:
         raise HTTPException(
@@ -100,7 +104,12 @@ def _redirect_if_available(
             ),
         )
     bucket, key = location
-    return RedirectResponse(presigned_keyframe_url(bucket, key, client=minio_client))
+    response = minio_client.get_object(bucket, key)
+    return StreamingResponse(
+        response.stream(32 * 1024),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @router.get("/keyframe/{video_id}/{frame_idx}/image")
