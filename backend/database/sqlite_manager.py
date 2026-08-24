@@ -93,6 +93,26 @@ class SqliteManager:
         return [r["entity"] for r in rows]
 
     @lru_cache(maxsize=8192)
+    def get_frame_objects_with_bbox(self, frame_id: int, min_score: float = 0.3) -> list[dict]:
+        """Trả về list object kèm bbox (normalized 0-1, gốc top-left) và score,
+        sort giảm dần theo score. Dùng để frontend vẽ overlay bounding box lên
+        keyframe -- KHÔNG dùng cho object_score trong merge() (dùng
+        get_frame_objects() cho việc đó)."""
+        rows = self._conn().execute(
+            "SELECT entity, score, xmin, ymin, xmax, ymax FROM objects "
+            "WHERE keyframe_id = ? AND score >= ? ORDER BY score DESC",
+            (frame_id, min_score),
+        ).fetchall()
+        return [
+            {
+                "entity": r["entity"],
+                "score": float(r["score"]),
+                "bbox": [float(r["xmin"]), float(r["ymin"]), float(r["xmax"]), float(r["ymax"])],
+            }
+            for r in rows
+        ]
+
+    @lru_cache(maxsize=8192)
     def get_frame_texts(self, frame_id: int) -> dict:
         """Trả về {"caption_text", "ocr_text", "asr_text"} cho 1 frame, dùng
         để Reranker build document cho cross-encoder. asr_text lấy từ segment
@@ -126,4 +146,5 @@ class SqliteManager:
         """
         self.get_frame_info.cache_clear()
         self.get_frame_objects.cache_clear()
+        self.get_frame_objects_with_bbox.cache_clear()
         self.get_frame_texts.cache_clear()

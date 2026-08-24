@@ -1,10 +1,16 @@
 """Các component Streamlit cho giao diện tìm kiếm."""
 
+import io
+
 import streamlit as st
+from PIL import Image, ImageDraw
 from api import AicApiClient
 
+# Màu box theo entity, cycle qua danh sách này để phân biệt nhiều object khác nhau
+_BOX_COLORS = ["#FF3B30", "#34C759", "#007AFF", "#FF9500", "#AF52DE", "#00C7BE"]
 
-def render_sidebar() -> tuple[str, int, int, bool]:
+
+def render_sidebar() -> tuple[str, int, int, bool, bool]:
     """Sidebar chọn loại truy vấn + tham số hiển thị."""
     with st.sidebar:
         st.header("Tuỳ chọn")
@@ -20,14 +26,50 @@ def render_sidebar() -> tuple[str, int, int, bool]:
                 "Tắt: tìm kiếm bằng đúng câu gốc, không gọi bước dịch."
             ),
         )
-    return mode, top_n, n_cols, translate
+        show_boxes = st.toggle(
+            "🔲 Hiện bounding box object",
+            value=False,
+            help="Vẽ box các object đã detect được lên ảnh kết quả (dữ liệu có sẵn từ SQLite, vẽ ở frontend nên không tốn tài nguyên backend).",
+        )
+    return mode, top_n, n_cols, translate, show_boxes
 
 
-def render_results(results: list[dict], api: AicApiClient, n_cols: int = 4):
+def _draw_bboxes(image_bytes: bytes, objects: list[dict]) -> bytes:
+    """Vẽ bounding box (toạ độ normalized 0-1) + nhãn entity lên ảnh.
+    Trả về ảnh gốc nguyên trạng nếu không parse được hoặc không có object."""
+    if not objects:
+        return image_bytes
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        return image_bytes
+    w, h = img.size
+    draw = ImageDraw.Draw(img)
+    for i, obj in enumerate(objects):
+        bbox = obj.get("bbox")
+        if not bbox or len(bbox) != 4:
+            continue
+        xmin, ymin, xmax, ymax = bbox
+        box_px = (xmin * w, ymin * h, xmax * w, ymax * h)
+        color = _BOX_COLORS[i % len(_BOX_COLORS)]
+        draw.rectangle(box_px, outline=color, width=3)
+        label = f'{obj.get("entity", "?")} {obj.get("score", 0):.2f}'
+        text_y = max(0, box_px[1] - 14)
+        draw.rectangle((box_px[0], text_y, box_px[0] + 8 * len(label), text_y + 14), fill=color)
+        draw.text((box_px[0] + 2, text_y), label, fill="white")
+    out = io.BytesIO()
+    img.save(out, format="JPEG")
+    return out.getvalue()
+
+
+def render_results(results: list[dict], api: AicApiClient, n_cols: int = 4, show_boxes: bool = False):
     """Hiển thị kết quả với schema công khai video_id/frame_idx/score.
 
     Ảnh được lấy riêng qua backend. Nếu key chưa tồn tại trên MinIO, metadata
     của kết quả vẫn được hiển thị và card chỉ hiện placeholder bằng text.
+    ``show_boxes``: vẽ bounding box các object đã detect (field "objects" từ
+    backend, đã kèm sẵn bbox normalized) trực tiếp ở frontend bằng PIL --
+    không tốn thêm resource backend.
     """
     if not results:
         st.info("Không có kết quả.")
@@ -45,6 +87,8 @@ def render_results(results: list[dict], api: AicApiClient, n_cols: int = 4):
             st.markdown('<div class="frame-card">', unsafe_allow_html=True)
             image = api.get_keyframe_image(video_id, frame_idx) if frame_idx != "-" else None
             if image is not None:
+                if show_boxes:
+                    image = _draw_bboxes(image, result.get("objects", []))
                 st.image(image, use_container_width=True)
             else:
                 st.info("Ảnh chưa có trên MinIO")

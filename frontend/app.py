@@ -24,7 +24,7 @@ st.title("🎥 AIC26 — Video Retrieval")
 
 API_URL = os.environ.get("API_URL") or st.secrets.get("API_URL", "http://localhost:8000")
 api = AicApiClient(API_URL)
-mode, top_n, n_cols, translate = render_sidebar()
+mode, top_n, n_cols, translate, show_boxes = render_sidebar()
 
 # Cache kết quả truy vấn gần nhất mỗi mode vào session_state. Cần thiết vì
 # n_cols/top_n là widget nằm ngoài form (sidebar) -- đổi giá trị của chúng
@@ -99,7 +99,7 @@ if mode == "KIS":
             lambda: api.search_kis(effective_query, top_n=top_n, translate=translate),
             query_key=effective_query,
         )
-    _render_cached("KIS", lambda results: render_results(results, api, n_cols))
+    _render_cached("KIS", lambda results: render_results(results, api, n_cols, show_boxes))
 
 elif mode == "Q&A":
     query = render_qa_input()
@@ -119,7 +119,7 @@ elif mode == "Q&A":
                 st.markdown(reasoning)
         st.markdown(f"### Trả lời\n{data['answer']}")
         st.divider()
-        render_results(data["sources"], api, n_cols)
+        render_results(data["sources"], api, n_cols, show_boxes)
 
     _render_cached("QA", _render_qa)
 
@@ -140,7 +140,7 @@ elif mode == "TRAKE":
     def _render_trake(payload):
         for event_text, event_results in zip(payload["events"], payload["results_per_event"]):
             st.subheader(f"📌 {event_text}")
-            render_results(event_results, api, n_cols)
+            render_results(event_results, api, n_cols, show_boxes)
             st.divider()
 
     _render_cached("TRAKE", _render_trake)

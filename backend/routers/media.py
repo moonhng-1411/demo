@@ -11,13 +11,13 @@ from database.sqlite_manager import SqliteManager
 
 router = APIRouter(prefix="/api", tags=["media"])
 
-FRAMES_BUCKET = os.environ.get("MINIO_BUCKET_FRAMES", "aic-frames")
+FRAMES_BUCKET = os.environ.get("MINIO_BUCKET_FRAMES", "original-images")
 MEDIA_DEBUG = os.environ.get("RAG_MEDIA_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _image_key(video_id: str, number: int) -> str:
-    """Tạo key chuẩn theo thứ tự keyframe trong video, ví dụ ``084.jpg``."""
-    return f"keyframes/{video_id}/{int(number):03d}.jpg"
+    """Tạo key chuẩn theo thứ tự keyframe trong video, ví dụ ``001.jpg``."""
+    return f"{video_id}/{int(number):03d}.jpg"
 
 
 def _clean_db_key(bucket: str, key: str | None) -> str | None:
@@ -54,7 +54,7 @@ def _candidate_locations(info: dict, video_id: str) -> list[tuple[str, str]]:
         locations.append((FRAMES_BUCKET, _image_key(video_id, int(n))))
     if keyframe_id is not None:
         locations.append((FRAMES_BUCKET, _image_key(video_id, int(keyframe_id))))
-        locations.append((FRAMES_BUCKET, f"keyframes/{video_id}/{int(keyframe_id)}.jpg"))
+        locations.append((FRAMES_BUCKET, f"{video_id}/{int(keyframe_id)}.jpg"))
 
     # Giữ thứ tự ưu tiên nhưng loại bỏ bản ghi trùng.
     return list(dict.fromkeys(locations))

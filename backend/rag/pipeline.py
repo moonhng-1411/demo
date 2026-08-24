@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 import time
@@ -8,6 +9,8 @@ import torch
 import torch.nn.functional as F
 import open_clip
 from sentence_transformers import SentenceTransformer, CrossEncoder
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -121,7 +124,9 @@ class QueryTranslator:
 
     def translate(self, text: str) -> str:
         if text in self._cache:
-            return self._cache[text]
+            translated = self._cache[text]
+            logger.info("translate (cached): %r -> %r", text, translated)
+            return translated
         r = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "system", "content": self.SYSTEM_PROMPT},
@@ -130,6 +135,7 @@ class QueryTranslator:
         )
         translated = r.choices[0].message.content.strip()
         self._cache[text] = translated
+        logger.info("translate: %r -> %r", text, translated)
         return translated
 
 
@@ -171,7 +177,9 @@ class QueryRewriter:
 
     def rewrite(self, text: str) -> str:
         if text in self._cache:
-            return self._cache[text]
+            rewritten = self._cache[text]
+            logger.info("rewrite (cached): %r -> %r", text, rewritten)
+            return rewritten
         r = self.client.chat.completions.create(
             model=self.model,
             messages=[{"role": "system", "content": self.SYSTEM_PROMPT},
@@ -180,6 +188,7 @@ class QueryRewriter:
         )
         rewritten = r.choices[0].message.content.strip()
         self._cache[text] = rewritten
+        logger.info("rewrite: %r -> %r", text, rewritten)
         return rewritten
 
 
@@ -187,18 +196,30 @@ class Retriever:
     """Gộp kết quả từ 2 FAISS index (text: caption+asr, clip: ảnh) thành
     1 dict {modality: [Candidate]} để đưa vào fusion."""
 
-    # Tách theo dấu câu/liên từ liệt kê (cũ) VÀ theo các từ nối chỉ trình tự
-    # thời gian ("đầu tiên", "sau đó", "tiếp theo", "cuối cùng"...) cùng dấu
-    # chấm câu -- cần thiết cho các query KIS/TRAKE-trong-1-câu kiểu "Đầu
-    # tiên là cảnh A. Sau đó là cảnh B.", vốn mô tả nhiều cảnh RẤT khác nhau
-    # nhưng trước đây bị encode chung thành 1 vector (semantic dilution nặng
-    # vì các cảnh không liên quan ngữ nghĩa, khác hẳn liệt kê "và"/"với" các
-    # chi tiết CÙNG một cảnh). "là" ngay sau từ nối được match luôn để không
-    # để sót ở đầu clause kế tiếp.
+    # Tách theo dấu câu MẠNH (kết câu) và liên từ liệt kê/trình tự thời gian
+    # ("đầu tiên", "sau đó", "tiếp theo", "cuối cùng"...) -- cần thiết cho
+    # các query KIS/TRAKE-trong-1-câu kiểu "Đầu tiên là cảnh A. Sau đó là
+    # cảnh B.", vốn mô tả nhiều cảnh RẤT khác nhau nhưng trước đây bị encode
+    # chung thành 1 vector (semantic dilution nặng vì các cảnh không liên
+    # quan ngữ nghĩa, khác hẳn liệt kê "và"/"với" các chi tiết CÙNG một
+    # cảnh). "là" ngay sau từ nối được match luôn để không để sót ở đầu
+    # clause kế tiếp. "ngay sau" thêm vào vì "ngay sau cảnh này" rất phổ
+    # biến trong query kiểu tường thuật.
+    #
+    # KHÔNG tách theo dấu phẩy (",") nữa: quan sát thực tế (RAG_PROFILE,
+    # query mô tả cảnh lia camera qua nhiều vật thể) cho thấy dấu phẩy
+    # thường phân cách các ITEM trong 1 danh sách liệt kê thuộc CÙNG một
+    # cảnh duy nhất (vd "ta thấy 4 sản phẩm: túi xách, chậu hoa, ấm trà"),
+    # không phải ranh giới giữa 2 cảnh khác nhau. Tách theo dấu phẩy biến
+    # "1 cảnh có 4 vật xuất hiện cùng lúc" thành 4 lượt search độc lập từng
+    # vật một -- mất hẳn ý nghĩa "cùng xuất hiện trong 1 cảnh", và mỗi lượt
+    # đơn lẻ ("chậu hoa") khớp bừa với bất kỳ frame nào có vật đó trong toàn
+    # dataset, không liên quan gì tới cảnh đang tìm.
     _SPLIT_RE = re.compile(
-        r"[,;.]"
+        r"[;.]"
         r"|(?:\bvà\b)|(?:\bvới\b)|(?:\btrong khi\b)"
         r"|(?:\bđầu tiên\b(?:\s+là\b)?)"
+        r"|(?:\bngay sau\b(?:\s+đó\b)?(?:\s+là\b)?)"
         r"|(?:\bsau đó\b(?:\s+là\b)?)"
         r"|(?:\btiếp theo\b(?:\s+là\b)?)"
         r"|(?:\bkế tiếp\b(?:\s+là\b)?)"
@@ -207,6 +228,20 @@ class Retriever:
         re.IGNORECASE,
     )
     _LONG_QUERY_TOKEN_THRESHOLD = 12
+    # Clause quá ngắn dễ là rác còn sót lại sau khi tách liên từ (vd "cảnh
+    # này", "nâng niu") -- không mang đủ nội dung thị giác để search có ích,
+    # chỉ thêm nhiễu vào fusion. Nâng ngưỡng từ >=2 lên >=3 token.
+    _MIN_CLAUSE_TOKENS = 3
+    # Clause chỉ nói về THỂ LOẠI/NGUỒN GỐC video (phóng sự, đoạn clip, bộ
+    # phim...) chứ không mô tả nội dung HÌNH ẢNH của 1 cảnh cụ thể -- caption
+    # keyframe luôn tả literal những gì thấy trong khung hình (vd "a group
+    # weaving baskets"), gần như không bao giờ chứa các từ meta này, nên
+    # search bằng clause này gần như thuần nhiễu. Lọc bỏ nếu clause chứa 1
+    # trong các từ khoá này.
+    _META_KEYWORDS = (
+        "phóng sự", "đoạn clip", "đoạn video", "đoạn phim", "bộ phim",
+        "chương trình", "tập phim", "video này", "clip này", "video clip",
+    )
 
     def __init__(self, faiss_manager, sqlite_manager, text_embedder=None,
                  clip_embedder=None, translator=None, rewriter=None):
@@ -260,15 +295,17 @@ class Retriever:
         """Tách câu dài thành các cụm ngắn theo dấu câu/liên từ tiếng Việt.
         Mỗi cụm được search riêng để tránh semantic dilution khi encode cả
         câu dài thành 1 vector duy nhất (hạn chế cố hữu của dense
-        single-vector retrieval với câu nhiều chi tiết)."""
+        single-vector retrieval với câu nhiều chi tiết). Loại clause quá
+        ngắn (rác còn sót lại sau khi tách liên từ) và clause chỉ nói về
+        thể loại/nguồn gốc video thay vì mô tả hình ảnh (xem _META_KEYWORDS)."""
         parts = [p.strip() for p in self._SPLIT_RE.split(query) if p and p.strip()]
-        return [p for p in parts if len(_tokenize(p)) >= 2]
-
-    # Hằng số RRF dùng để chấm điểm rank-based CỤC BỘ trong 1 fragment (câu
-    # gốc/bản dịch/rewrite/1 clause), tách biệt với RRF_K dùng ở merge() để
-    # gộp nhiều modality lại với nhau -- 2 tầng RRF độc lập, xem docstring
-    # search().
-    _FRAGMENT_RRF_K = 60
+        clauses = [
+            p for p in parts
+            if len(_tokenize(p)) >= self._MIN_CLAUSE_TOKENS
+            and not any(kw in p.lower() for kw in self._META_KEYWORDS)
+        ]
+        logger.info("split_clauses: %r -> %r", query, clauses)
+        return clauses
 
     def search(self, query: str, top_k: int = 50, translate: bool = True) -> dict:
         """Truy vấn cả hai index text và CLIP.
@@ -288,31 +325,39 @@ class Retriever:
           _split_clauses).
         Mỗi lượt search phụ này gọi là 1 "fragment" của query gốc.
 
-        THIẾT KẾ ĐIỂM SỐ -- vì sao dùng rank-based (RRF) thay vì cosine
-        similarity thô:
-        Cách cũ cộng thẳng cosine similarity (nhân hệ số <1 theo fragment)
-        của MỌI fragment vào chung 1 pool rồi để merge() sort theo giá trị
-        đó. Nhưng cosine similarity của các fragment khác nhau (câu dài
-        đầy đủ vs. 1 clause ngắn/hẹp) không cùng thang đo: 1 frame chỉ
-        khớp with đúng 1 clause hẹp (vd chỉ "tạo hình trái tim bằng tay")
+        THIẾT KẾ ĐIỂM SỐ -- vì sao KHÔNG cộng thẳng cosine similarity thô,
+        và vì sao đổi từ RRF thuần rank sang min-max normalize (_normalized_scores):
+        Cách cũ nhất (cộng thẳng cosine similarity thô, nhân hệ số <1 theo
+        fragment) có vấn đề: cosine similarity của các fragment khác nhau
+        (câu dài đầy đủ vs. 1 clause ngắn/hẹp) không cùng thang đo -- 1 frame
+        chỉ khớp với đúng 1 clause hẹp (vd chỉ "tạo hình trái tim bằng tay")
         có thể đạt similarity rất cao cho riêng clause đó, đủ để similarity
         đã nhân hệ số vẫn cao hơn hẳn 1 frame khớp *toàn bộ* câu nhưng chỉ
-        vừa phải -- dẫn tới "chỉ khớp 1 đoạn trong query vẫn lọt top",
-        đúng vấn đề observe được trong thực tế.
+        vừa phải -- dẫn tới "chỉ khớp 1 đoạn trong query vẫn lọt top".
 
-        Để chống lại, mỗi fragment chỉ đóng góp điểm RANK-BASED (kiểu RRF:
-        1/(k+rank), rank tính RIÊNG trong phạm vi kết quả của fragment đó,
-        theo từng modality) thay vì cosine similarity thô. Điểm rank-based
-        luôn bị CHẶN TRẦN ở khoảng 1/(k+1) bất kể similarity gốc cao đến
-        đâu, nên 1 match "ăn may" cực mạnh ở 1 fragment hẹp không thể áp
-        đảo được nữa. Đồng thời, đóng góp từ NHIỀU fragment khác nhau được
-        CỘNG DỒN cho cùng 1 frame_id (nhân trọng số fragment: 1.0 câu gốc,
-        0.9 dịch/rewrite, 0.7 mỗi clause) -- nên 1 frame được nhiều fragment
-        (= nhiều phần khác nhau của query) cùng "đồng thuận" sẽ có tổng
-        điểm cao hơn hẳn 1 frame chỉ được đúng 1 fragment công nhận, đúng ý
-        "phải khớp cả query" thay vì chỉ 1 đoạn.
+        Bản RRF thuần rank (đã dùng trước đây) sửa được vấn đề thang đo đó,
+        nhưng lại đi quá tay: bỏ HẲN độ chênh lệch similarity thật trong
+        MỘT fragment -- hit rank 1 của 1 fragment có 1 match áp đảo (vd
+        similarity 0.9, hit kế tiếp chỉ 0.3) và hit rank 1 của 1 fragment
+        mà mọi hit đều na ná nhau (0.4-0.42) được cộng điểm y hệt nhau, dù
+        độ tin cậy thực tế khác hẳn. Query nhiều fragment (câu dài bị tách
+        clause) vì vậy mất tín hiệu "fragment nào khớp rõ ràng" so với
+        "fragment nào chỉ khớp mù mờ".
+
+        Fix: mỗi fragment chỉ đóng góp điểm đã MIN-MAX NORMALIZE trong
+        phạm vi kết quả của chính fragment đó (theo từng modality) --
+        xem _normalized_scores -- thay vì cosine thô hay rank thuần. Vẫn
+        bounded về [0, 1] như RRF (chặn trần, fragment hẹp không áp đảo
+        được nhờ thang đo), nhưng giữ lại được độ chênh lệch tương đối
+        BÊN TRONG fragment thay vì làm phẳng hoàn toàn về rank. Đóng góp
+        từ NHIỀU fragment khác nhau vẫn được CỘNG DỒN cho cùng 1 frame_id
+        (nhân trọng số fragment: 1.0 câu gốc, 0.9 dịch/rewrite, 0.7 mỗi
+        clause) -- nên 1 frame được nhiều fragment (= nhiều phần khác nhau
+        của query) cùng "đồng thuận" sẽ có tổng điểm cao hơn hẳn 1 frame
+        chỉ được đúng 1 fragment công nhận, đúng ý "phải khớp cả query"
+        thay vì chỉ 1 đoạn.
         """
-        # modality -> frame_id -> điểm rank-based đã cộng dồn qua các fragment
+        # modality -> frame_id -> điểm normalized đã cộng dồn qua các fragment
         accum: dict[str, dict[int, float]] = {"caption": {}, "asr": {}, "visual": {}}
         # frame_id -> Candidate mẫu (giữ metadata video_id/frame_idx/timestamp
         # từ lần đầu gặp -- KHÔNG dùng field .score của candidate này, điểm
@@ -323,27 +368,27 @@ class Retriever:
 
         def _accumulate_text(raw_hits, weight: float) -> None:
             """raw_hits: list[(entry, modality, score)] từ faiss_manager.search_text.
-            Nhóm theo modality trước khi tính rank -- 1 lượt search_text có
-            thể trả về hit của nhiều modality (caption/asr) xen kẽ nhau,
-            tính rank lẫn lộn sẽ sai lệch thứ hạng thật trong từng modality.
+            Nhóm theo modality trước khi chuẩn hoá score -- 1 lượt search_text
+            có thể trả về hit của nhiều modality (caption/asr) xen kẽ nhau,
+            gộp lẫn sẽ làm min-max lệch giữa 2 thang điểm khác nhau.
             """
             by_modality: dict[str, list[tuple[int, Candidate]]] = {}
             for entry, modality, score in raw_hits:
                 c = self._text_candidate(entry, modality, score)
                 by_modality.setdefault(modality, []).append((c.frame_id, c))
             for modality, hits in by_modality.items():
-                rrf = _rrf_scores([fid for fid, _ in hits], k=self._FRAGMENT_RRF_K)
+                norm = _normalized_scores(hits)
                 for fid, c in hits:
                     frame_lookup.setdefault(fid, c)
-                    accum[modality][fid] = accum[modality].get(fid, 0.0) + weight * rrf[fid]
+                    accum[modality][fid] = accum[modality].get(fid, 0.0) + weight * norm[fid]
 
         def _accumulate_clip(raw_hits, weight: float) -> None:
             """raw_hits: list[(frame_id, score)] từ faiss_manager.search_clip."""
             hits = [(fid, self._visual_candidate(fid, score)) for fid, score in raw_hits]
-            rrf = _rrf_scores([fid for fid, _ in hits], k=self._FRAGMENT_RRF_K)
+            norm = _normalized_scores(hits)
             for fid, c in hits:
                 frame_lookup.setdefault(fid, c)
-                accum["visual"][fid] = accum["visual"].get(fid, 0.0) + weight * rrf[fid]
+                accum["visual"][fid] = accum["visual"].get(fid, 0.0) + weight * norm[fid]
 
         # QUAN TRỌNG: text_embedder/clip_embedder ở đây là CLIP ViT-B/32 bản
         # gốc "openai" (xem dependencies.py) -- encoder này KHÔNG multilingual,
@@ -469,7 +514,16 @@ class Retriever:
 
 
 DEFAULT_MODALITY_WEIGHTS = {"caption": 1.0, "asr": 0.8, "visual": 1.0}
-DEFAULT_OBJECT_WEIGHT = 0.5
+# Giảm object_weight: chỉ ~64% keyframe có object detect (xem aic.sqlite),
+# và taxonomy Open Images (475 nhãn) chỉ là danh từ chung (Person, Man, Car...),
+# không có màu sắc/hành động/thuộc tính. Weight 0.5 làm frame KHÔNG có object
+# (object_score=0.0) bị thiệt thòi so với frame có object dù độ liên quan
+# thực tế tương đương -- ảnh hưởng nặng nhất đúng vào các query mô tả chi
+# tiết. Hạ xuống 0.15: object_score vẫn có tác dụng "tie-breaker" tăng nhẹ
+# các frame khớp nhãn rõ ràng (vd query "xe hơi" ưu tiên frame có nhãn Car),
+# nhưng không còn lấn át tín hiệu CLIP/caption (bao phủ 100% frame, đã hiểu
+# thuộc tính/màu/hành động qua joint embedding) khi object thiếu hoặc thô.
+DEFAULT_OBJECT_WEIGHT = 0.15
 RRF_K = 60  # hằng số chuẩn của Reciprocal Rank Fusion (Cormack et al.), ít nhạy với giá trị cụ thể
 
 
@@ -531,6 +585,34 @@ def _rrf_scores(ranked_frame_ids: list[int], k: int = RRF_K) -> dict:
     """Reciprocal Rank Fusion: frame xếp hạng càng cao (rank nhỏ) thì điểm
     càng lớn, không phụ thuộc vào thang điểm gốc khác nhau giữa các modality."""
     return {fid: 1.0 / (k + rank) for rank, fid in enumerate(ranked_frame_ids, start=1)}
+
+
+def _normalized_scores(hits: list[tuple[int, "Candidate"]]) -> dict:
+    """Min-max normalize similarity score gốc trong phạm vi 1 fragment/modality
+    (vd 1 lượt search bằng 1 clause, hoặc 1 lượt search CLIP), thay cho
+    rank-based RRF ở tầng fragment trong Retriever.search().
+
+    Lý do đổi: RRF chỉ giữ THỨ HẠNG, bỏ hẳn ĐỘ CHÊNH LỆCH similarity thật --
+    hit rank 1 của 1 fragment có 1 match áp đảo (similarity 0.9, hit thứ 2
+    chỉ 0.3) và hit rank 1 của 1 fragment mà mọi hit đều na ná nhau
+    (similarity 0.4-0.42) được cộng điểm Y HỆT NHAU, dù độ tin cậy thực tế
+    khác nhau rõ rệt. Với query nhiều fragment (câu dài bị tách clause),
+    điều này làm mất tín hiệu "fragment nào thực sự khớp rõ" so với
+    "fragment nào chỉ khớp mù mờ".
+
+    Vẫn bounded về [0, 1] (giống RRF bị chặn trần ở 1/(k+1)) nên fragment
+    hẹp không thể áp đảo fragment rộng chỉ nhờ thang đo similarity khác
+    nhau -- đúng lý do RRF được chọn ban đầu (xem docstring Retriever.search),
+    chỉ khác là giữ lại được độ tin cậy tương đối BÊN TRONG fragment thay vì
+    làm phẳng hoàn toàn về rank.
+    """
+    if not hits:
+        return {}
+    scores = [c.score for _, c in hits]
+    lo, hi = min(scores), max(scores)
+    if hi - lo < 1e-9:
+        return {fid: 1.0 for fid, _ in hits}
+    return {fid: (c.score - lo) / (hi - lo) for fid, c in hits}
 
 
 def merge(candidates_by_modality: dict, query: str = None, sqlite_manager=None,
@@ -740,8 +822,18 @@ class RagPipeline:
     """Điều phối toàn bộ flow retrieve -> fuse -> rerank -> (LLM nếu cần),
     theo 3 loại truy vấn của AIC: KIS, QA/VQA, TRAKE."""
 
-    @staticmethod
-    def _public_result(result: RerankedResult) -> dict:
+    def _objects_field(self, frame_id: int) -> list[dict]:
+        """Lấy list object kèm bbox cho 1 frame để frontend vẽ overlay.
+        Không raise nếu sqlite_manager thiếu (an toàn cho test/mock)."""
+        sqlite_manager = getattr(self.retriever, "sqlite_manager", None)
+        if sqlite_manager is None:
+            return []
+        try:
+            return sqlite_manager.get_frame_objects_with_bbox(int(frame_id))
+        except Exception:
+            return []
+
+    def _public_result(self, result: RerankedResult) -> dict:
         """Response sau CrossEncoder. keyframe_id hiển thị là ``n`` (số thứ
         tự keyframe trong video, format 3 chữ số như tên file ảnh trên
         MinIO), KHÔNG phải id toàn cục trong SQLite."""
@@ -750,16 +842,17 @@ class RagPipeline:
             "frame_idx": result.frame_idx,
             "keyframe_id": f"{result.n:03d}",
             "score": float(result.rerank_score),
+            "objects": self._objects_field(result.frame_id),
         }
 
-    @staticmethod
-    def _public_candidate(candidate: Candidate) -> dict:
+    def _public_candidate(self, candidate: Candidate) -> dict:
         """Response nhanh dùng điểm fusion (fast_kis), không chạy CrossEncoder."""
         return {
             "video_id": candidate.video_id,
             "frame_idx": candidate.frame_idx,
             "keyframe_id": f"{candidate.n:03d}",
             "score": float(candidate.score),
+            "objects": self._objects_field(candidate.frame_id),
         }
 
     def __init__(self, retriever, reranker, llm_client=None, top_k_retrieve=50,
