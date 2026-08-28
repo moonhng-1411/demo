@@ -74,42 +74,45 @@ def _draw_bboxes(image_bytes: bytes, objects: list[dict]) -> bytes:
     return out.getvalue()
 
 
-def _render_neighbor_strip(video_id, frame_idx, api: AicApiClient, window: int, state_key: str):
-    """Filmstrip các keyframe lân cận (cùng video, +-window theo thứ tự sample).
+@st.dialog("🎞️ Keyframe lân cận", width="large")
+def _neighbor_dialog(video_id, frame_idx, api: AicApiClient, window: int, key_prefix: str = "res"):
+    """Modal kiểu Google Drive: ảnh chính phóng to + filmstrip lân cận bên dưới,
+    bấm vào 1 thumbnail trong filmstrip sẽ đổi ảnh chính (không đóng dialog).
 
-    Chỉ gọi API (metadata + tải ảnh) khi người dùng THẬT SỰ bấm nút cho đúng
-    card này -- dùng ``st.session_state[state_key]`` làm cờ, KHÔNG dùng
-    ``st.expander`` để chặn, vì Streamlit chạy lại toàn bộ code bên trong
-    expander ở mọi lần rerun bất kể đang đóng hay mở (chỉ phần hiển thị bị
-    ẩn), nên nếu dùng expander thì mọi card trên lưới kết quả sẽ tự động gọi
-    lại API + tải ảnh mỗi lần trang rerun (vd khi đổi slider khác), dù người
-    dùng chưa mở card nào."""
-    is_open = st.session_state.get(state_key, False)
-    label = "🎞️ Ẩn keyframe lân cận" if is_open else "🎞️ Xem keyframe lân cận"
-    if st.button(label, key=f"{state_key}-btn"):
-        st.session_state[state_key] = not is_open
-        st.rerun()
-
-    if not st.session_state.get(state_key, False):
-        return
+    ``st.dialog`` chỉ chạy hàm này khi dialog đang mở (do người dùng bấm nút
+    kích hoạt ở nơi gọi), nên không có vấn đề gọi API thừa mỗi lần rerun như
+    cách expander cũ."""
+    state_key = f"nb_dialog_focus-{key_prefix}-{video_id}-{frame_idx}"
+    focus_idx = st.session_state.get(state_key, frame_idx)
 
     neighbors = api.get_keyframe_neighbors(video_id, frame_idx, window=window)
     if not neighbors:
         st.caption("Không tìm được keyframe lân cận (video có thể chỉ có 1 keyframe, hoặc lỗi kết nối).")
         return
+
+    main_image = api.get_keyframe_image(video_id, focus_idx)
+    st.caption(f"Video: {video_id} — frame idx {focus_idx}" + (" (gốc)" if focus_idx == frame_idx else ""))
+    if main_image is not None:
+        st.image(main_image, use_container_width=True)
+    else:
+        st.info("Chưa có ảnh")
+
+    st.divider()
     strip_cols = st.columns(len(neighbors))
     for j, nb in enumerate(neighbors):
         with strip_cols[j]:
             nb_frame_idx = nb.get("frame_idx")
-            image = api.get_keyframe_image(video_id, nb_frame_idx)
-            if image is not None:
-                st.image(image, use_container_width=True)
+            thumb = api.get_keyframe_image(video_id, nb_frame_idx)
+            if thumb is not None:
+                st.image(thumb, use_container_width=True)
             else:
                 st.info("Chưa có ảnh")
             caption = f"idx {nb_frame_idx}"
             if nb.get("is_target"):
-                caption = f"➡️ {caption} (gốc)"
-            st.caption(caption)
+                caption = f"➡️ {caption}"
+            if st.button(caption, key=f"{state_key}-pick-{nb_frame_idx}", use_container_width=True):
+                st.session_state[state_key] = nb_frame_idx
+                st.rerun()
 
 
 def render_results(
@@ -165,10 +168,12 @@ def render_results(
                 unsafe_allow_html=True,
             )
             if neighbor_window > 0 and frame_idx != "-":
-                _render_neighbor_strip(
-                    video_id, frame_idx, api, neighbor_window,
-                    state_key=f"nb_open-{key_prefix}-{video_id}-{frame_idx}",
-                )
+                if st.button(
+                    "🔍 Xem lân cận",
+                    key=f"nb_open-{key_prefix}-{video_id}-{frame_idx}",
+                    use_container_width=True,
+                ):
+                    _neighbor_dialog(video_id, frame_idx, api, neighbor_window, key_prefix=key_prefix)
             st.markdown('</div>', unsafe_allow_html=True)
 
 
