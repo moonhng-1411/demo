@@ -526,6 +526,24 @@ DEFAULT_MODALITY_WEIGHTS = {"caption": 1.0, "asr": 0.8, "visual": 1.0}
 DEFAULT_OBJECT_WEIGHT = 0.15
 RRF_K = 60  # hằng số chuẩn của Reciprocal Rank Fusion (Cormack et al.), ít nhạy với giá trị cụ thể
 
+# Nhãn Open Images quá chung chung -- xuất hiện ở gần như MỌI frame có người
+# (taxonomy chỉ có danh từ chung, không phân biệt hành động/thuộc tính).
+# CLIP text encoder cluster các khái niệm rộng này rất gần embedding của hầu
+# hết query có nhắc tới người, nên gần như query nào cũng vượt threshold
+# trong _object_score() và được cộng bonus -- dù object detect ra hoàn toàn
+# đúng, nó không giúp phân biệt frame này với hàng ngàn frame khác cũng có
+# người. Loại các nhãn này khỏi object_score để bonus chỉ còn dành cho nhãn
+# thực sự đặc trưng (vd "Car", "Umbrella", "Guitar"), tránh 1 frame có
+# "Person"/"Human face" điểm cao bị đẩy vào fused top-k của MỌI query bất kể
+# nội dung. Không xoá khỏi objects trả về cho frontend (vẫn hiện đúng data
+# detect được, chỉ loại khỏi công thức tính điểm fusion).
+_GENERIC_OBJECT_LABELS = frozenset({
+    "person", "human", "human body", "human face", "human head",
+    "man", "woman", "boy", "girl", "human arm", "human leg",
+    "human hand", "human eye", "human nose", "human mouth", "human ear",
+    "clothing", "animal",
+})
+
 
 def _tokenize(text: str) -> list[str]:
     """Tách text thành list token chữ/số, lowercase -- dùng cho object score
@@ -546,7 +564,7 @@ def _label_embedding(label: str, embedder) -> np.ndarray:
 
 
 def _object_score(query_vec: np.ndarray, object_labels: list[str], embedder,
-                   threshold: float = 0.35) -> float:
+                   threshold: float = 0.35, generic_label_factor: float = 0.25) -> float:
     """Điểm khớp object = cosine similarity cao nhất giữa embedding query
     (multilingual, đã encode 1 lần trong search()) và embedding từng nhãn
     object (tiếng Anh, kiểu Open Images). Thay cho so khớp substring cũ:
@@ -556,14 +574,27 @@ def _object_score(query_vec: np.ndarray, object_labels: list[str], embedder,
     threshold để cắt các cặp similarity thấp/nhiễu về 0, tránh cộng điểm
     ngẫu nhiên cho object không liên quan. Giá trị 0.35 là khởi điểm --
     nên tune lại bằng cách log similarity thật trên vài trăm cặp
-    (query, label) của hệ thống."""
+    (query, label) của hệ thống.
+
+    Nhãn trong _GENERIC_OBJECT_LABELS (xem docstring hằng số đó) được chấm
+    NHƯNG chỉ giữ ``generic_label_factor`` phần điểm sau khi đã qua ngưỡng --
+    không loại hẳn về 0, vì trường hợp hiếm frame đúng chỉ còn dựa được vào
+    object_score để lọt candidate pool (caption/visual modality yếu/sai cho
+    đúng frame đó) vẫn còn 1 phần tín hiệu, thay vì mất trắng. Ngưỡng
+    threshold LUÔN so trên similarity GỐC (chưa scale) -- nếu so trên giá trị
+    đã nhân factor, nhãn generic gần như không bao giờ qua được ngưỡng (vd
+    similarity tuyệt đối 1.0 x 0.25 = 0.25 < 0.35), vô tình quay lại loại
+    hẳn dù đó không phải ý định."""
     if not object_labels:
         return 0.0
-    best = max(
-        float(np.dot(query_vec, _label_embedding(l, embedder)))
-        for l in object_labels
-    )
-    return best if best >= threshold else 0.0
+    best = 0.0
+    for label in object_labels:
+        sim = float(np.dot(query_vec, _label_embedding(label, embedder)))
+        if sim < threshold:
+            continue
+        contribution = sim * generic_label_factor if label.strip().lower() in _GENERIC_OBJECT_LABELS else sim
+        best = max(best, contribution)
+    return best
 
 
 def _dedupe_by_frame(candidates: list) -> list:

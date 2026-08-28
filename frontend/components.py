@@ -10,6 +10,24 @@ from api import AicApiClient
 _BOX_COLORS = ["#FF3B30", "#34C759", "#007AFF", "#FF9500", "#AF52DE", "#00C7BE"]
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def _cached_keyframe_image(_api: AicApiClient, video_id, frame_idx) -> bytes | None:
+    """Cache ảnh keyframe theo (video_id, frame_idx) trong session.
+
+    Tham số ``_api`` đặt dấu gạch dưới để Streamlit KHÔNG hash object này khi
+    tính cache key (AicApiClient không hashable theo nghĩa hữu ích) -- chỉ
+    video_id/frame_idx mới quyết định cache hit. Nhờ vậy khi rerun do mở
+    dialog xem lân cận, các card kết quả khác không tải lại ảnh đã có."""
+    return _api.get_keyframe_image(video_id, frame_idx)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def _cached_keyframe_neighbors(_api: AicApiClient, video_id, frame_idx, window: int) -> list[dict]:
+    """Cache metadata neighbor theo (video_id, frame_idx, window), cùng lý do
+    dùng ``_api`` như trên."""
+    return _api.get_keyframe_neighbors(video_id, frame_idx, window=window)
+
+
 def render_sidebar() -> tuple[str, int, int, bool, bool, int]:
     """Sidebar chọn loại truy vấn + tham số hiển thị.
 
@@ -76,43 +94,112 @@ def _draw_bboxes(image_bytes: bytes, objects: list[dict]) -> bytes:
 
 @st.dialog("🎞️ Keyframe lân cận", width="large")
 def _neighbor_dialog(video_id, frame_idx, api: AicApiClient, window: int, key_prefix: str = "res"):
-    """Modal kiểu Google Drive: ảnh chính phóng to + filmstrip lân cận bên dưới,
-    bấm vào 1 thumbnail trong filmstrip sẽ đổi ảnh chính (không đóng dialog).
+    """Modal kiểu thư viện ảnh (Google Photos): ảnh chính phóng to ở trên,
+    2 nút mũi tên ◀▶ để trượt qua lại, VÀ filmstrip toàn bộ neighbor bên
+    dưới (ảnh đang xem được viền sáng) -- bấm thumbnail cũng nhảy tới đó.
 
-    ``st.dialog`` chỉ chạy hàm này khi dialog đang mở (do người dùng bấm nút
-    kích hoạt ở nơi gọi), nên không có vấn đề gọi API thừa mỗi lần rerun như
-    cách expander cũ."""
-    state_key = f"nb_dialog_focus-{key_prefix}-{video_id}-{frame_idx}"
-    focus_idx = st.session_state.get(state_key, frame_idx)
-
-    neighbors = api.get_keyframe_neighbors(video_id, frame_idx, window=window)
+    ``st.dialog`` chạy nội dung như 1 fragment riêng (Streamlit >=1.37):
+    tương tác widget bên trong dialog chỉ rerun dialog, KHÔNG rerun toàn bộ
+    app -- nên ``st.rerun(scope="fragment")`` ở đây không đụng tới lưới kết
+    quả phía sau (không tải lại ảnh đáp án)."""
+    neighbors = _cached_keyframe_neighbors(api, video_id, frame_idx, window)
     if not neighbors:
         st.caption("Không tìm được keyframe lân cận (video có thể chỉ có 1 keyframe, hoặc lỗi kết nối).")
         return
 
-    main_image = api.get_keyframe_image(video_id, focus_idx)
-    st.caption(f"Video: {video_id} — frame idx {focus_idx}" + (" (gốc)" if focus_idx == frame_idx else ""))
-    if main_image is not None:
-        st.image(main_image, use_container_width=True)
-    else:
-        st.info("Chưa có ảnh")
+    idx_key = f"nb_pos-{key_prefix}-{video_id}-{frame_idx}"
+    target_pos = next((k for k, nb in enumerate(neighbors) if nb.get("is_target")), len(neighbors) // 2)
+    pos = st.session_state.get(idx_key, target_pos)
+    pos = max(0, min(pos, len(neighbors) - 1))
 
+    current = neighbors[pos]
+    cur_frame_idx = current.get("frame_idx")
+    main_image = _cached_keyframe_image(api, video_id, cur_frame_idx)
+
+    st.markdown(
+        """
+        <style>
+        @keyframes nbSlideIn { from { opacity: 0; transform: translateX(var(--nb-slide-x, 24px)); }
+                                to   { opacity: 1; transform: translateX(0); } }
+        .nb-slide { animation: nbSlideIn 0.2s ease-out; }
+        .nb-thumb-active img { border: 3px solid #FF9500 !important; border-radius: 4px; }
+        /* Nút chọn frame trong filmstrip: chữ không xuống dòng, cỡ nhỏ lại
+           để không vỡ layout khi có nhiều cột hẹp (window lớn). */
+        .nb-strip button p { white-space: nowrap !important; font-size: 0.78rem !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # --- Ảnh chính + mũi tên trượt ---
+    nav_prev, nav_main, nav_next = st.columns([1, 8, 1])
+    with nav_prev:
+        st.write("")
+        st.write("")
+        if st.button("◀", key=f"{idx_key}-prev", disabled=pos == 0, width="stretch"):
+            st.session_state[idx_key] = pos - 1
+            st.rerun(scope="fragment")
+    with nav_next:
+        st.write("")
+        st.write("")
+        if st.button("▶", key=f"{idx_key}-next", disabled=pos == len(neighbors) - 1, width="stretch"):
+            st.session_state[idx_key] = pos + 1
+            st.rerun(scope="fragment")
+    with nav_main:
+        slide_dir = "-24px" if pos < target_pos else "24px"
+        st.markdown(f'<div class="nb-slide" style="--nb-slide-x:{slide_dir}">', unsafe_allow_html=True)
+        if main_image is not None:
+            st.image(main_image, width="stretch")
+        else:
+            st.info("Chưa có ảnh")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    caption = f"Video {video_id} — frame idx {cur_frame_idx} ({pos + 1}/{len(neighbors)})"
+    if current.get("is_target"):
+        caption += "  ➡️ gốc"
+    st.caption(caption)
+
+    # --- Filmstrip toàn bộ neighbor, ảnh đang xem viền cam ---
+    # Giới hạn tối đa _STRIP_MAX_COLS cột/hàng: window lớn (vd 10 -> tối đa
+    # 21 neighbor) nếu nhét hết vào 1 hàng thì mỗi cột quá hẹp, chữ "idx xxx"
+    # vỡ dòng xấu (đã gặp thực tế). Nhiều hơn thì tự xuống hàng tiếp theo.
+    _STRIP_MAX_COLS = 8
     st.divider()
-    strip_cols = st.columns(len(neighbors))
-    for j, nb in enumerate(neighbors):
-        with strip_cols[j]:
-            nb_frame_idx = nb.get("frame_idx")
-            thumb = api.get_keyframe_image(video_id, nb_frame_idx)
-            if thumb is not None:
-                st.image(thumb, use_container_width=True)
-            else:
-                st.info("Chưa có ảnh")
-            caption = f"idx {nb_frame_idx}"
-            if nb.get("is_target"):
-                caption = f"➡️ {caption}"
-            if st.button(caption, key=f"{state_key}-pick-{nb_frame_idx}", use_container_width=True):
-                st.session_state[state_key] = nb_frame_idx
-                st.rerun()
+    st.markdown('<div class="nb-strip">', unsafe_allow_html=True)
+    for row_start in range(0, len(neighbors), _STRIP_MAX_COLS):
+        row_neighbors = list(enumerate(neighbors))[row_start:row_start + _STRIP_MAX_COLS]
+        strip_cols = st.columns(len(row_neighbors))
+        for col, (j, nb) in zip(strip_cols, row_neighbors):
+            with col:
+                nb_frame_idx = nb.get("frame_idx")
+                thumb = _cached_keyframe_image(api, video_id, nb_frame_idx)
+                css_class = "nb-thumb-active" if j == pos else ""
+                st.markdown(f'<div class="{css_class}">', unsafe_allow_html=True)
+                if thumb is not None:
+                    st.image(thumb, width="stretch")
+                else:
+                    st.info("—")
+                st.markdown("</div>", unsafe_allow_html=True)
+                thumb_label = f"{nb_frame_idx}"
+                if nb.get("is_target"):
+                    thumb_label = f"➡️ {thumb_label}"
+                if st.button(thumb_label, key=f"{idx_key}-pick-{nb_frame_idx}", width="stretch"):
+                    st.session_state[idx_key] = j
+                    st.rerun(scope="fragment")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+@st.fragment
+def _neighbor_trigger(video_id, frame_idx, api: AicApiClient, window: int, key_prefix: str):
+    """Nút mở dialog xem lân cận, bọc trong fragment riêng để bấm nút này
+    (và tương tác bên trong dialog) không kéo theo rerun toàn bộ lưới kết
+    quả -- các ảnh đáp án khác trên trang giữ nguyên, không tải/vẽ lại."""
+    if st.button(
+        "🔍 Xem lân cận",
+        key=f"nb_open-{key_prefix}-{video_id}-{frame_idx}",
+        width='stretch',
+    ):
+        _neighbor_dialog(video_id, frame_idx, api, window, key_prefix=key_prefix)
 
 
 def render_results(
@@ -151,11 +238,11 @@ def render_results(
         score = float(result.get("score", result.get("rerank_score", 0.0)))
         with cols[i % n_cols]:
             st.markdown('<div class="frame-card">', unsafe_allow_html=True)
-            image = api.get_keyframe_image(video_id, frame_idx) if frame_idx != "-" else None
+            image = _cached_keyframe_image(api, video_id, frame_idx) if frame_idx != "-" else None
             if image is not None:
                 if show_boxes:
                     image = _draw_bboxes(image, result.get("objects", []))
-                st.image(image, use_container_width=True)
+                st.image(image, width='stretch')
             else:
                 st.info("Ảnh chưa có trên MinIO")
             st.markdown(
@@ -168,12 +255,7 @@ def render_results(
                 unsafe_allow_html=True,
             )
             if neighbor_window > 0 and frame_idx != "-":
-                if st.button(
-                    "🔍 Xem lân cận",
-                    key=f"nb_open-{key_prefix}-{video_id}-{frame_idx}",
-                    use_container_width=True,
-                ):
-                    _neighbor_dialog(video_id, frame_idx, api, neighbor_window, key_prefix=key_prefix)
+                _neighbor_trigger(video_id, frame_idx, api, neighbor_window, key_prefix)
             st.markdown('</div>', unsafe_allow_html=True)
 
 
