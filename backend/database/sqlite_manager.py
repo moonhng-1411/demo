@@ -137,6 +137,25 @@ class SqliteManager:
             "asr_text": seg["text"] if seg else None,
         }
 
+    def get_neighbor_frames(self, video_id: str, n: int, window: int = 2) -> list[dict]:
+        """Trả về các keyframe lân cận (cùng video) trong khoảng ``n - window``
+        đến ``n + window`` theo thứ tự keyframe trong video (cột ``n``), đã
+        sort tăng dần theo ``n``. Bao gồm cả chính keyframe ``n`` (frontend tự
+        biết đâu là frame gốc dựa vào so sánh ``n``).
+
+        Dùng ``n`` (thứ tự trong video) thay vì ``frame_idx`` (chỉ số frame
+        gốc theo video) làm trục "gần nhau" vì keyframe được sample thưa từ
+        video -- hai frame_idx kề nhau trong bảng objects/captions không nhất
+        thiết là hai khoảnh khắc gần nhau trên timeline thực, còn ``n`` liền
+        kề luôn tương ứng đúng 2 keyframe cạnh nhau đã sample.
+        """
+        rows = self._conn().execute(
+            "SELECT id, video_id, n, frame_idx, pts_time FROM keyframes "
+            "WHERE video_id = ? AND n BETWEEN ? AND ? ORDER BY n",
+            (str(video_id), int(n) - int(window), int(n) + int(window)),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def clear_caches(self) -> None:
         """Xóa toàn bộ lru_cache (frame_info/frame_objects/frame_texts).
 

@@ -10,8 +10,12 @@ from api import AicApiClient
 _BOX_COLORS = ["#FF3B30", "#34C759", "#007AFF", "#FF9500", "#AF52DE", "#00C7BE"]
 
 
-def render_sidebar() -> tuple[str, int, int, bool, bool]:
-    """Sidebar chọn loại truy vấn + tham số hiển thị."""
+def render_sidebar() -> tuple[str, int, int, bool, bool, int]:
+    """Sidebar chọn loại truy vấn + tham số hiển thị.
+
+    ``neighbor_window`` trả về 0 nếu tắt tính năng xem keyframe lân cận
+    (không hiện expander trên frame-card), >0 là số keyframe lấy về mỗi
+    phía khi mở expander."""
     with st.sidebar:
         st.header("Tuỳ chọn")
         mode = st.radio("Loại truy vấn", ["KIS", "Q&A", "TRAKE"])
@@ -31,7 +35,15 @@ def render_sidebar() -> tuple[str, int, int, bool, bool]:
             value=False,
             help="Vẽ box các object đã detect được lên ảnh kết quả (dữ liệu có sẵn từ SQLite, vẽ ở frontend nên không tốn tài nguyên backend).",
         )
-    return mode, top_n, n_cols, translate, show_boxes
+        show_neighbors = st.toggle(
+            "🎞️ Cho phép xem keyframe lân cận",
+            value=True,
+            help="Hiện nút mở rộng trên mỗi kết quả để xem các keyframe ngay trước/sau nó trong cùng video.",
+        )
+        neighbor_window = (
+            st.slider("Số keyframe lấy mỗi phía khi bấm xem", 1, 10, 10) if show_neighbors else 0
+        )
+    return mode, top_n, n_cols, translate, show_boxes, neighbor_window
 
 
 def _draw_bboxes(image_bytes: bytes, objects: list[dict]) -> bytes:
@@ -62,7 +74,52 @@ def _draw_bboxes(image_bytes: bytes, objects: list[dict]) -> bytes:
     return out.getvalue()
 
 
-def render_results(results: list[dict], api: AicApiClient, n_cols: int = 4, show_boxes: bool = False):
+def _render_neighbor_strip(video_id, frame_idx, api: AicApiClient, window: int, state_key: str):
+    """Filmstrip các keyframe lân cận (cùng video, +-window theo thứ tự sample).
+
+    Chỉ gọi API (metadata + tải ảnh) khi người dùng THẬT SỰ bấm nút cho đúng
+    card này -- dùng ``st.session_state[state_key]`` làm cờ, KHÔNG dùng
+    ``st.expander`` để chặn, vì Streamlit chạy lại toàn bộ code bên trong
+    expander ở mọi lần rerun bất kể đang đóng hay mở (chỉ phần hiển thị bị
+    ẩn), nên nếu dùng expander thì mọi card trên lưới kết quả sẽ tự động gọi
+    lại API + tải ảnh mỗi lần trang rerun (vd khi đổi slider khác), dù người
+    dùng chưa mở card nào."""
+    is_open = st.session_state.get(state_key, False)
+    label = "🎞️ Ẩn keyframe lân cận" if is_open else "🎞️ Xem keyframe lân cận"
+    if st.button(label, key=f"{state_key}-btn"):
+        st.session_state[state_key] = not is_open
+        st.rerun()
+
+    if not st.session_state.get(state_key, False):
+        return
+
+    neighbors = api.get_keyframe_neighbors(video_id, frame_idx, window=window)
+    if not neighbors:
+        st.caption("Không tìm được keyframe lân cận (video có thể chỉ có 1 keyframe, hoặc lỗi kết nối).")
+        return
+    strip_cols = st.columns(len(neighbors))
+    for j, nb in enumerate(neighbors):
+        with strip_cols[j]:
+            nb_frame_idx = nb.get("frame_idx")
+            image = api.get_keyframe_image(video_id, nb_frame_idx)
+            if image is not None:
+                st.image(image, use_container_width=True)
+            else:
+                st.info("Chưa có ảnh")
+            caption = f"idx {nb_frame_idx}"
+            if nb.get("is_target"):
+                caption = f"➡️ {caption} (gốc)"
+            st.caption(caption)
+
+
+def render_results(
+    results: list[dict],
+    api: AicApiClient,
+    n_cols: int = 4,
+    show_boxes: bool = False,
+    neighbor_window: int = 0,
+    key_prefix: str = "res",
+):
     """Hiển thị kết quả với schema công khai video_id/frame_idx/score.
 
     Ảnh được lấy riêng qua backend. Nếu key chưa tồn tại trên MinIO, metadata
@@ -70,6 +127,12 @@ def render_results(results: list[dict], api: AicApiClient, n_cols: int = 4, show
     ``show_boxes``: vẽ bounding box các object đã detect (field "objects" từ
     backend, đã kèm sẵn bbox normalized) trực tiếp ở frontend bằng PIL --
     không tốn thêm resource backend.
+    ``neighbor_window``: 0 để tắt hẳn expander "keyframe lân cận"; >0 là số
+    keyframe lấy mỗi phía khi người dùng mở expander (xem
+    ``_render_neighbor_strip``).
+    ``key_prefix``: tiền tố duy nhất cho key Streamlit của expander mỗi
+    card -- cần thiết khi cùng 1 kết quả có thể lặp lại ở nhiều nơi trong
+    trang (vd nhiều event của TRAKE) để tránh đụng key.
     """
     if not results:
         st.info("Không có kết quả.")
@@ -101,6 +164,11 @@ def render_results(results: list[dict], api: AicApiClient, n_cols: int = 4, show
                 f'</div>',
                 unsafe_allow_html=True,
             )
+            if neighbor_window > 0 and frame_idx != "-":
+                _render_neighbor_strip(
+                    video_id, frame_idx, api, neighbor_window,
+                    state_key=f"nb_open-{key_prefix}-{video_id}-{frame_idx}",
+                )
             st.markdown('</div>', unsafe_allow_html=True)
 
 

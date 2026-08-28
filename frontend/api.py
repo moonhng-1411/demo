@@ -56,6 +56,22 @@ class AicApiClient:
         safe_video_id = quote(str(video_id), safe="")
         return f"{self.base_url}/api/keyframe/{safe_video_id}/{int(frame_idx)}/image"
 
+    def get_keyframe_neighbors(self, video_id: str, frame_idx: int, window: int = 2) -> list[dict]:
+        """Metadata các keyframe lân cận (cùng video) quanh 1 kết quả, trả
+        về [] nếu lỗi kết nối/không tìm thấy (an toàn để gọi trong UI)."""
+        try:
+            safe_video_id = quote(str(video_id), safe="")
+            resp = requests.get(
+                f"{self.base_url}/api/keyframe/{safe_video_id}/{int(frame_idx)}/neighbors",
+                params={"window": window},
+                timeout=15,
+            )
+            if not resp.ok:
+                return []
+            return resp.json().get("neighbors", [])
+        except requests.RequestException:
+            return []
+
     def get_keyframe_image(self, video_id: str, frame_idx: int) -> bytes | None:
         """Tải ảnh nếu đã có; trả None cho ảnh chưa upload hoặc lỗi kết nối."""
         try:

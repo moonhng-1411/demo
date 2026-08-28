@@ -128,6 +128,44 @@ def keyframe_image_by_position(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.get("/keyframe/{video_id}/{frame_idx}/neighbors")
+def keyframe_neighbors(
+    video_id: str,
+    frame_idx: int,
+    window: int = 2,
+    sqlite_manager: SqliteManager = Depends(get_sqlite_manager),
+):
+    """Trả về metadata các keyframe lân cận (cùng video, +-``window`` theo
+    thứ tự sample ``n``) cho kết quả frame_idx đã cho -- KHÔNG bao gồm ảnh
+    (frontend tự gọi endpoint ảnh sẵn có cho từng frame_idx trả về ở đây).
+
+    ``window`` giới hạn 1..10 để tránh trả về quá nhiều frame nếu client
+    truyền giá trị bất thường.
+    """
+    window = max(1, min(int(window), 10))
+    try:
+        keyframe_id = sqlite_manager.resolve_frame_position(video_id, frame_idx)
+        info = sqlite_manager.get_frame_info(keyframe_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    neighbors = sqlite_manager.get_neighbor_frames(video_id, info["n"], window=window)
+    return {
+        "video_id": video_id,
+        "frame_idx": frame_idx,
+        "neighbors": [
+            {
+                "video_id": n["video_id"],
+                "frame_idx": n["frame_idx"],
+                "keyframe_id": f"{n['n']:03d}",
+                "pts_time": n["pts_time"],
+                "is_target": n["frame_idx"] == frame_idx,
+            }
+            for n in neighbors
+        ],
+    }
+
+
 @router.get("/keyframe/{frame_id}/image")
 def keyframe_image_legacy(
     frame_id: int,
